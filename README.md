@@ -1,7 +1,7 @@
-# MeLD — Medical Longitudinal Latent Diffusion Models
+# MeLD — Medical Longitudinal Latent Diffusion
 
 This is the implementation of the MeLD model described in the paper:
-**Generating Faithful Synthetic Longitudinal HIV Cohorts for Clinically Grounded Data Analysis**
+**Generating Synthetic Multi-national Longitudinal Cohorts for Clinically Grounded HIV Research**
 <!-- by Zhuohui J Liang, Zhuohang Li, Nicholas Jackson, Yanink Caro-Vega, Ronaldo I.
 Moreiraa, Fabio Paredes, Jordany Bernadin, Diana Varela, Carina Cesar, Alessandro
 Blasimme, Jessica M. Perkins, Amir Asiaee, Stephany N. Duda, Bradley A.
