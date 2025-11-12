@@ -2,10 +2,10 @@
 
 This is the implementation of the MeLD model described in the paper:
 **Generating Faithful Synthetic Longitudinal HIV Cohorts for Clinically Grounded Data Analysis**
-by Zhuohui J Liang, Zhuohang Li, Nicholas Jackson, Yanink Caro-Vega, Ronaldo I.
+<!-- by Zhuohui J Liang, Zhuohang Li, Nicholas Jackson, Yanink Caro-Vega, Ronaldo I.
 Moreiraa, Fabio Paredes, Jordany Bernadin, Diana Varela, Carina Cesar, Alessandro
 Blasimme, Jessica M. Perkins, Amir Asiaee, Stephany N. Duda, Bradley A.
-Malin, Bryan E. Shepherd, and Chao Yan
+Malin, Bryan E. Shepherd, and Chao Yan -->
 
 A collection of scripts and model implementations for learning latent representations from longitudinal medical data and generating synthetic patient time series using a VAE + DiT (Diffusion Transformer) pipeline.
 
