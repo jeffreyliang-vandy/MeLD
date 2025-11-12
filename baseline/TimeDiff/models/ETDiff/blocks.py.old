@@ -1,0 +1,723 @@
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchcde
+from einops import rearrange
+
+import models.ETDiff.utils as utils
+
+############### TimeDiT implementation
+from timm.models.vision_transformer import Attention, Mlp
+
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    https://github.com/facebookresearch/DiT/blob/ed81ce2229091fd4ecc9a223645f95cf379d582b/models.py#L27
+    """
+
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32)
+            / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class LearnablePositionalEncoding(nn.Module):
+    """
+    https://github.com/Y-debug-sys/Diffusion-TS/blob/13a2186e6442669f70afe07dcd3632466f6ee10a/Models/interpretable_diffusion/model_utils.py#L66
+    """
+
+    def __init__(self, d_model, dropout=0.1, max_len=1024):
+        super(LearnablePositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        # Each position gets its own embedding
+        # Since indices are always 0 ... max_len, we don't have to do a look-up
+        self.pe = nn.Parameter(
+            torch.empty(1, max_len, d_model)
+        )  # requires_grad automatically set to True
+        nn.init.uniform_(self.pe, -0.02, 0.02)
+
+    def forward(self, x):
+        r"""Inputs of forward function
+        Args:
+            x: the sequence fed to the positional encoder model (required).
+        Shape:
+            x: [batch size, sequence length, embed dim]
+            output: [batch size, sequence length, embed dim]
+        """
+        # print(x.shape)
+        x = x + self.pe
+        return self.dropout(x)
+
+class TimeSeries2EmbLinear(nn.Module):
+    """
+    Encode time series data alone with selected dimension.
+    """
+
+    def __init__(
+        self,
+        hidden_size=512,
+        feature_last=True,
+        shape=(24, 6),
+        dim2emb="time",
+        dropout=0,
+    ):
+        super().__init__()
+        assert dim2emb in ["time", "feature"], "Please indicate which dim to emb"
+        if feature_last:
+            sequence_length, feature_size = shape
+        else:
+            feature_size, sequence_length = shape
+
+        self.feature_last = feature_last
+        self.dim2emb = dim2emb
+        self.pos_emb = LearnablePositionalEncoding(
+            d_model=hidden_size, max_len=sequence_length
+        )
+        if dim2emb == "time":
+            self.processing = nn.Sequential(
+                nn.Linear(feature_size, hidden_size), nn.Dropout(dropout)
+            )
+        else:
+            self.processing = nn.Sequential(
+                nn.Linear(sequence_length, hidden_size), nn.Dropout(dropout)
+            )
+
+    def forward(self, x):
+        if not self.feature_last:
+            x = x.permute(0, 2, 1)
+
+        if self.dim2emb == "time":
+            x = self.processing(x)
+            return self.pos_emb(x)
+        return self.processing(x.permute(0, 2, 1))
+
+class TransformerEncoderBlock(nn.Module):
+    """
+    Vanilla transformer encoder block.
+    """
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dropout=0., **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(
+            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
+        )
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=0,
+        )
+        self.dropout = nn.Dropout(0)
+
+    def forward(self, x):
+        x = x + self.dropout(self.attn(self.norm1(x)))
+        x = x + self.dropout(self.mlp(self.norm2(x)))
+        return x
+
+
+class Encoder(nn.Module):
+    def __init__(self, input_channels, output_channels, seq_len, hidden_size=512, num_heads=8, n_layers=3, mlp_ratio=4.0,dropout = 0.):
+        super().__init__()
+        self.encoder_blocks = nn.Sequential(
+            *[
+                TransformerEncoderBlock(
+                    hidden_size=hidden_size, num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=dropout
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        self.input_shape = (seq_len,input_channels)
+
+        self.time2emb = TimeSeries2EmbLinear(
+            hidden_size=hidden_size,
+            feature_last=True,
+            shape=self.input_shape,
+            dim2emb="time",
+            dropout=dropout,
+        )
+
+        self.proj = nn.Linear(hidden_size,output_channels)
+
+    def forward(self, x):
+        x = self.time2emb(x)
+
+        for index in range(len(self.encoder_blocks)):
+            x = self.encoder_blocks[index](x)
+
+        x = self.proj(x)
+
+        return x, None
+    
+############### BiRNN implementation
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 500):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)                         # (max_len,1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) *
+                             (-math.log(10000.0) / d_model))                # (d_model/2,)
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))                           # (1,max_len,d_model)
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len, :]
+        return self.dropout(x)
+
+from typing import List, Callable
+class FeedForward(nn.Module):
+    def __init__(self, in_dim: int, hidden_dims: List[int], out_dim: int, activation: Callable=nn.ReLU(), final_activation: Callable=None):
+        super().__init__()
+
+        hidden_dims = hidden_dims[:]
+        hidden_dims.append(out_dim)
+
+        layers = [nn.Linear(in_dim, hidden_dims[0])]
+
+        for i in range(len(hidden_dims) - 1):
+            layers.append(activation)
+            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
+
+        if final_activation is not None:
+            layers.append(final_activation)
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)    
+    
+class BiRNN_score(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, diffusion_steps,dropout = 0):
+        super(BiRNN_score, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.input_proj = FeedForward(input_size, [], hidden_size)
+        self.t_enc = PositionalEncoding(hidden_size, max_len=1)
+        self.i_enc = PositionalEncoding(hidden_size, max_len=diffusion_steps) 
+        self.proj = FeedForward(3 * hidden_size, [], hidden_size, final_activation=nn.ReLU())
+        
+        self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers, batch_first=True, bidirectional=True, dropout=dropout)
+        self.layer_norm = nn.LayerNorm(2 * hidden_size)
+        self.fc = nn.Linear(2 * hidden_size, input_size)
+        self.self_condition = False
+        
+    def forward(self, x, time, x_self_cond = None):
+
+        x = x.permute(0,2,1)
+        shape = x.shape
+        x = x.view(-1, *shape[-2:])
+
+        t = torch.rand(shape[0],shape[1], 1,).sort(1)[0].to(x.device)
+        # t = t.view(-1, shape[-2], 1)
+        # i = i.view(-1, shape[-2], 1)
+        time = time.view(shape[0], 1, 1).expand(shape[0], shape[1], 1)  #time is i is diffustion timestep
+        
+        x = self.input_proj(x)
+        t = self.t_enc(t)
+        time = self.i_enc(time)
+
+        x = self.proj(torch.cat([x, t, time], -1))   
+        
+        out, _ = self.lstm(x)
+        output = self.layer_norm(out)
+        final_out = self.fc(output)
+        
+        return final_out.permute(0,2,1)
+
+
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class CDEFunction(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int, second_hidden_channels: int, num_layers: int=3):
+        super().__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+
+        self.init_linear = nn.Linear(hidden_channels, second_hidden_channels)
+        self.linear_layers = nn.ModuleList([nn.Linear(second_hidden_channels, second_hidden_channels) for _ in range(num_layers)])
+        self.final_linear = nn.Linear(second_hidden_channels, input_channels * hidden_channels)
+
+    def forward(self, t, z):            # t is needed for torchcde library, just a placeholder
+        z = self.init_linear(z)
+        z = F.relu(z)
+        
+        for linear in self.linear_layers:
+            z = linear(z)
+            z = F.relu(z)
+
+        z = self.final_linear(z)
+        z = F.tanh(z)           # recommended to use tanh by Neural CDE author
+        z = z.view(z.size(0), self.hidden_channels, self.input_channels)
+        return z
+
+
+class FirstLinearBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, bias: bool=True, groups: int=8):
+        super().__init__()
+        
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, out_channels * 2),
+        ) if utils.exists(time_dim) else None
+        
+        self.linear = nn.Linear(in_channels, out_channels, bias=bias)
+        self.norm = nn.GroupNorm(groups, out_channels)
+    
+    def forward(self, x, time_embed):
+        time_embed = self.time_mlp(time_embed)
+        time_embed = rearrange(time_embed, 'b c -> b c 1')
+        time_tuple = time_embed.chunk(2, dim=1)
+        
+        x = self.linear(x)
+        x = self.norm(x)
+        
+        scaling, shifts = time_tuple
+        x = x.unsqueeze(-1) * (scaling + 1) + shifts
+        return x.squeeze(-1)
+
+
+class LastLinearBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, bias: bool=True, groups: int=10):
+        super().__init__()
+        
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, out_channels * 2),
+        ) if utils.exists(time_dim) else None
+        
+        self.linear = nn.Linear(in_channels, out_channels, bias=bias)
+        self.norm = nn.GroupNorm(groups, out_channels)
+    
+    def forward(self, x, time_embed):
+        time_embed = self.time_mlp(time_embed)
+        time_embed = rearrange(time_embed, 'b c -> b c 1')
+        time_tuple = time_embed.chunk(2, dim=1)
+        
+        x = self.linear(x)
+        x = x.permute(0, 2, 1)              # permute for group norm
+        x = self.norm(x)
+        
+        scaling, shifts = time_tuple
+        x = x * (scaling + 1) + shifts
+        x = x.permute(0, 2, 1)              # permute back
+        return x
+
+def Upsample(dim, dim_out = None):
+    return nn.Sequential(
+        nn.Upsample(scale_factor = 2, mode = 'nearest'),
+        nn.Conv1d(dim, utils.default(dim_out, dim), 3, padding = 1)
+    )
+
+def Downsample(dim, dim_out = None):
+    return nn.Conv1d(dim, utils.default(dim_out, dim), 4, 2, 1)
+
+class NeuralCDE(nn.Module):
+    def __init__(
+        self,
+        input_channels: int,
+        seq_len: int,
+        hidden_channels: int,
+        second_hidden_channels: int,
+        num_layers: int,
+        output_channels: int,
+        self_condition: bool=False,
+        embed_dim: int= 64,
+        time_dim: int= 256,
+        solver: str = "rk4",
+    ):
+        super().__init__()
+        assert all(isinstance(var, int) for var in [input_channels, hidden_channels, second_hidden_channels, num_layers, output_channels, embed_dim, time_dim, seq_len]), "must be integer!"
+        
+        # attributes
+        self.self_condition = self_condition
+        self.time_dim_partition = seq_len
+        self.solver = solver
+        
+        # neural CDE networks
+        self.cde_func = CDEFunction(
+            input_channels = input_channels, 
+            hidden_channels = hidden_channels, 
+            second_hidden_channels = second_hidden_channels,
+            num_layers = num_layers,
+        )
+        self.fc_init = FirstLinearBlock(input_channels, hidden_channels, time_dim, groups=8)                 # groups need to be adjusted based on input
+        self.fc_last = LastLinearBlock(hidden_channels*8, output_channels, time_dim, groups=2)    
+        
+        # time embedding
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb(embed_dim),
+            nn.Linear(embed_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim),
+        )
+        
+        self.upsample1 = Upsample(1, seq_len // 4)
+        self.upsample2 = Upsample(seq_len // 4, seq_len // 2)
+        self.upsample3 = Upsample(seq_len // 2, seq_len)
+        # RNN for upsampling
+        # self.rnn = nn.GRU()
+    
+    def get_min_diff(self, times: torch.Tensor):
+        time_diffs = times[1:] - times[:-1]
+        return time_diffs.min().item()
+    
+    def process_times(self, spline):
+        if self.time_dim_partition is None or self.time_dim_partition == 2:
+            return spline.interval          # use end time and start time
+        elif self.time_dim_partition > 2:
+            return torch.linspace(spline.interval[0], spline.interval[1], self.time_dim_partition)
+        else:
+            raise ValueError(f"Invalid time partition value!\nGot \"{self.time_dim_partition}\" but it can be only None or integer >= 2!")
+
+    def forward(self, x, time, x_self_cond = None):
+        """
+        Defines forward pass for prediction, x is some noisy sample.
+        x is of dimension (batch_size, timesteps, channels)
+        """
+        x = x.permute(0, 2, 1)                          # permute to fit neural CDE
+        if self.self_condition:
+            x_self_cond = utils.default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim = 1)
+        
+        coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x)           # slow, but it must be here
+        spline = torchcde.CubicSpline(coeffs)
+        x = spline.evaluate(spline.interval[0])
+        
+        t = self.time_emb(time)                         # this is for diffusion time steps
+        
+        x = self.fc_init(x, t)                          # initial value
+        # times = self.process_times(spline).to(next(self.parameters()).device)              # this is for neural CDE solutions
+        # min_diff = self.get_min_diff(times)
+        
+        # solve CDE
+        x = torchcde.cdeint(
+            X = spline,
+            z0 = x,
+            func = self.cde_func,
+            t = spline.interval,
+            method = self.solver,
+            # options = {"step_size": min_diff},
+        )
+        x = x[:, 1].unsqueeze(1)
+        x = self.upsample1(x)
+        x = self.upsample2(x)
+        x = self.upsample3(x)
+        x = F.silu(self.fc_last(x, t))
+        return x.permute(0, 2, 1)                       # permute back to fit GaussianDiffusion()
+
+
+class RMSNorm(nn.Module):
+    """
+    Reference
+    ---------
+        Zhang, Biao, and Rico Sennrich. "Root mean square layer normalization." Advances in Neural Information Processing Systems 32 (2019).
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.g = nn.Parameter(torch.ones(1, dim, 1))
+
+    def forward(self, x):
+        return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = RMSNorm(dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
+
+
+class EfficientAttention(nn.Module):
+    """
+    Reference
+    ---------
+        Shen, Zhuoran, et al. "Efficient attention: Attention with linear complexities." Proceedings of the IEEE/CVF winter conference on applications of computer vision. 2021.
+    """
+    def __init__(self, dim, heads = 4, dim_head = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_out = nn.Sequential(
+            nn.Conv1d(hidden_dim, dim, 1),
+            RMSNorm(dim)
+        )
+
+    def forward(self, x):
+        b, c, n = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim = 1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+
+        q = q.softmax(dim = -2)
+        k = k.softmax(dim = -1)
+        q = q * self.scale        
+
+        context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
+
+        out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
+        out = rearrange(out, 'b h c n -> b (h c) n', h = self.heads)
+        return self.to_out(out)
+
+
+class RNNBlock(nn.Module):
+    def __init__(self, input_channels, output_channels, layers, batch_first, dropout, bidirectional, time_dim, model):
+        super().__init__()
+        if model == "lstm":
+            self.rnn = nn.LSTM(input_channels, output_channels, layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        elif model == "gru":
+            self.rnn = nn.GRU(input_channels, output_channels, layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        elif model == "transformer":
+            d_model = output_channels * 2 if bidirectional else output_channels
+            self.rnn = Encoder(input_channels, d_model, 120, hidden_size = 256, num_heads=8, n_layers=layers, mlp_ratio=4, dropout= dropout)
+        else:
+            raise ValueError(f"Invalid model name \"{model}\"! It can be only \"lstm\" or \"gru\"!")
+        
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, output_channels * 4 if bidirectional else output_channels * 2),
+        )
+        # self.norm = nn.GroupNorm(groups, output_channels * 2 if bidirectional else output_channels)
+        # self.norm = RMSNorm(output_channels * 2 if bidirectional else output_channels)
+        self.norm = nn.LayerNorm(output_channels * 2 if bidirectional else output_channels)
+    
+    def forward(self, x, time_embed):
+        """input is (batch_size, channels, timesteps)"""
+        x = x.permute(0, 2, 1)
+        time_embed = self.time_mlp(time_embed)
+        time_embed = rearrange(time_embed, 'b c -> b c 1')
+        time_tuple = time_embed.chunk(2, dim=1)
+        
+        outputs = self.rnn(x)
+        hidden = outputs[0]
+        # hidden = hidden.permute(0, 2, 1)
+        # x = self.norm(hidden)
+        x = self.norm(hidden).permute(0, 2, 1)
+        
+        scaling, shifts = time_tuple
+        x = x * (scaling + 1) + shifts
+        return x.permute(0, 2, 1)
+
+
+class RNN(nn.Module):
+    def __init__(
+        self, 
+        input_channels, 
+        hidden_channels, 
+        output_channels,
+        layers, 
+        model = "lstm",
+        dropout = 0, 
+        bidirectional  = True, 
+        self_condition = False,
+        embed_dim = 64,
+        time_dim = 256,
+        ):
+        super().__init__()
+        self.self_condition = self_condition
+        
+        self.rnn = RNNBlock(
+            input_channels, hidden_channels, layers, 
+            time_dim=time_dim, model=model,
+            batch_first=True, dropout=dropout, bidirectional=bidirectional
+        )
+
+        # time embedding
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb(embed_dim),
+            nn.Linear(embed_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim),
+        )
+        hidden_channels = utils.times_two_if_bidirectional(hidden_channels, bidirectional)
+        self.fc = nn.Linear(hidden_channels, output_channels)
+
+    def forward(self, x, time, x_self_cond = None):
+        if self.self_condition:
+            x_self_cond = utils.default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim = 2)
+        
+        t = self.time_emb(time)
+        x = self.rnn(x, t)
+        x = self.fc(x)
+        return x.permute(0, 2, 1)
+
+
+class EncoderRNNBlock(nn.Module):
+    def __init__(self, input_channels, output_channels, layers, batch_first, dropout, bidirectional, time_dim, model):
+        super().__init__()
+        if model == "lstm":
+            self.rnn = nn.LSTM(input_channels, output_channels, layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        elif model == "gru":
+            self.rnn = nn.GRU(input_channels, output_channels, layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        else:
+            raise ValueError(f"Invalid model name \"{model}\"! It can be only \"lstm\" or \"gru\"!")
+        
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, output_channels * 2),
+        )
+        self.ht_norm = RMSNorm(output_channels)
+        self.ct_norm = RMSNorm(output_channels)
+    
+    def forward(self, x, time_embed):
+        """input is (batch_size, channels, timesteps)"""
+        x = x.permute(0, 2, 1)
+        time_embed = self.time_mlp(time_embed)
+        time_embed = rearrange(time_embed, 'b c -> b c 1')
+        time_tuple = time_embed.chunk(2, dim=1)
+        
+        outputs, (ht, ct) = self.rnn(x)
+        ht, ct = self.ht_norm(ht.permute(0,2,1)).permute(0,2,1), self.ct_norm(ct.permute(0,2,1)).permute(0,2,1)
+        
+        scaling, shifts = time_tuple
+        scaling, shifts = scaling.permute(2,0,1), shifts.permute(2,0,1)
+        ht = ht * (scaling + 1) + shifts
+        ct = ct * (scaling + 1) + shifts
+        return (ht, ct)
+    
+
+class DecoderRNNBlock(nn.Module):
+    def __init__(self, input_channels, output_channels, layers, batch_first, dropout, bidirectional, model):
+        super().__init__()
+        if model == "lstm":
+            self.rnn = nn.LSTM(input_channels, output_channels, layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        elif model == "gru":
+            self.rnn = nn.GRU(input_channels, output_channels, layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        else:
+            raise ValueError(f"Invalid model name \"{model}\"! It can be only \"lstm\" or \"gru\"!")
+    
+    def forward(self, input, hidden):
+        x = self.rnn(input, hidden)
+        return x[0]         # return output only, not hidden state
+
+
+class EncoderDecoderRNN(nn.Module):
+    def __init__(
+        self, 
+        input_channels, 
+        hidden_channels, 
+        output_channels,
+        layers, 
+        model = "lstm",
+        dropout = 0, 
+        bidirectional  = True, 
+        self_condition = False,
+        embed_dim = 64,
+        time_dim = 256,
+        ):
+        super().__init__()
+        assert model in ["lstm", "gru"], "Invalid model name! It can be only \"lstm\" or \"gru\"!"
+        
+        self.self_condition = self_condition
+        
+        self.encode_rnn = EncoderRNNBlock(
+            input_channels, hidden_channels, layers, 
+            time_dim=time_dim, model=model,
+            batch_first=True, dropout=dropout, bidirectional=bidirectional
+        )
+        self.decode_rnn = DecoderRNNBlock(
+            input_channels, hidden_channels, layers,
+            batch_first=True, dropout=dropout, bidirectional=bidirectional, model=model,
+        )
+
+        # time embedding
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb(embed_dim),
+            nn.Linear(embed_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim),
+        )
+        hidden_channels = utils.times_two_if_bidirectional(hidden_channels, bidirectional)
+        self.fc = nn.Linear(hidden_channels, output_channels)
+    
+    def forward(self, x, time, x_self_cond = None):
+        if self.self_condition:
+            x_self_cond = utils.default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim = 2)
+        
+        t = self.time_emb(time)
+        hidden = self.encode_rnn(x, t)
+        noise = torch.randn_like(x).permute(0,2,1)
+        x = self.decode_rnn(noise, hidden)
+        x = self.fc(x)
+        return x.permute(0,2,1)
+
+
+        
+        
+        
+        
+    
+    
+        
+        
+    
