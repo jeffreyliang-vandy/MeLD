@@ -10,14 +10,15 @@ Malin, Bryan E. Shepherd, and Chao Yan -->
 A collection of scripts and model implementations for learning latent representations from longitudinal medical data and generating synthetic patient time series using a VAE + DiT (Diffusion Transformer) pipeline.
 
 ## Repository layout (important files)
-- `model` - VAE model definitions and utilities
-- `LightningDiT/` — Diffusion Transformer implementation and training utilities (see `LightningDiT/README.md` for details)
+- `model/timeautoencoder.py` - VAE model definitions and utilities
+- `model/LightningDiT/` — Diffusion Transformer implementation and training utilities
 - `1_train_vae.py` — Train a VAE on your dataset and save model checkpoints
 - `2_sample_latent.py` — Encode data into latent representations using a trained VAE
 - `3_train_DiT.sh` — Wrapper to train LightningDiT on latent samples (requires a config in `LightningDiT/configs/`)
 - `4_sample_synthetic_data.py` — Convert generated latent samples back into original data space
 - `evaluation/` — Metrics and evaluation scripts used in the paper
-- `baseline/` — bundled baseline models used by the pipeline
+- `baseline/` — Bundled baseline models used by the pipeline
+- `0_data_preprocess.ipynb` - Example preprocess code and Pseudo data
 
 ## Quickstart — run the main pipeline
 
@@ -31,7 +32,7 @@ Install dependencies (example using a virtualenv):
 ```bash
 # create and activate a venv
 conda create -n meld_vae -f model/environment.yaml
-conda create -n meld_dit -f LightningDiT/requirements.txt
+conda create -n meld_dit -f model/LightningDiT/requirements.txt
 ```
 
 ### Pipeline (order matters)
@@ -70,8 +71,18 @@ python 4_sample_synthetic_data.py \
 
 ## Configuration notes
 
-- `LightningDiT/configs/` contains example configs used for training the DiT model. Copy and adapt those for your dataset and compute budget.
+- `model/LightningDiT/configs/` contains example configs used for training the DiT model. Copy and adapt those for your dataset and compute budget.
 - Data preprocessing can be found in `0_data_preprocessing.py`, and model-specific data logic can be found under `HALO_Inpatient/`, `SynTEG/`, `TimeDiff` and `TimeAutoDiff/` — review those scripts when preparing your dataset.
+- We provide baseline models code from 
+    - LLM based model `HALO_Inpatient/`, 
+    - GAN based model `SynTEG/`, `
+    - diffusion based model `TimeDiff` and 
+    - latent diffusion based model `TimeAutoDiff/` 
+
+    in `baseline/`, detailed describhe of the baselines can be found in the paper.or the original paper.
+
+
+- In paper, MeLD variants are implemented with training the diffusion components of `MeLD-DDPM`, `MeLD-DiT`, `TimeDiff` and `TimeAutoDiff` on latent sample from `2_sample_latent.py`.
 
 ## Evaluation
 
