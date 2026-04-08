@@ -102,6 +102,7 @@ class Embedding_data(nn.Module):
     def forward(self, x, missing, masking=None):
         
         x_disc = x[:,:,0:self.n_disc].long().to(device)
+        # print(x_disc.shape)
         x_nums = x[:,:,self.n_disc:self.n_disc+self.n_nums].to(device)
 
         ####### Addition Approach
@@ -109,6 +110,8 @@ class Embedding_data(nn.Module):
 
         # Process individual embeddings and sum them
         if self.n_disc > 0:
+            # print(len(self.embeddings_list))
+            # print(x_emb_sum.shape)
             for i, embedding in enumerate(self.embeddings_list):
                 x_emb_sum += embedding(x_disc[:, :, i])  # Element-wise addition instead of concatenation
 
@@ -431,25 +434,11 @@ def load_checkpoint(model, optimizer, CHECKPOINT_DIR, checkpoint_path=None,train
         else:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, checkpoints[-1]) 
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            if not train_decoder:
-                model.load_state_dict(checkpoint['model_state_dict'],strict=False)
-                # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            else:
-                # Extract the full state dictionary
-                full_state_dict = checkpoint['model_state_dict']
-                
-                # Filter out encoder state and remove the prefix "encoder."
-                encoder_state_dict = {
-                    key.replace("encoder.", ""): value 
-                    for key, value in full_state_dict.items() if key.startswith("encoder.")
-                }
-                
-                # Load state dictionaries into the respective modules
-                model.encoder.load_state_dict(encoder_state_dict)
 
-            # start_epoch = checkpoint['epoch']
-            # best_loss = checkpoint['loss']
-            start_epoch = 0
-            best_loss = float("inf")
+            model.load_state_dict(checkpoint['model_state_dict'],strict=False)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_loss = checkpoint['loss']
+
             print(f"🔄 Loaded checkpoint from {checkpoint_path} (Epoch {start_epoch}) with Best Loss:{best_loss}")
             return start_epoch, best_loss
