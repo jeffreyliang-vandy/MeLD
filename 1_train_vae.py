@@ -287,7 +287,7 @@ def main():
                 else:
                     patience += 1
                     if patience > args.patience and max_beta > args.min_beta:
-                        max_beta = max(max_beta * 0.1, args.min_beta)
+                        max_beta = max(max_beta * 0.5, args.min_beta)
                         main_log(f"Patience > {args.patience}. Reducing max_beta to: {max_beta:.6f}")
                         beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/5), ratio=0.8)
                         patience = 0

@@ -102,7 +102,6 @@ class Embedding_data(nn.Module):
     def forward(self, x, missing, masking=None):
         
         x_disc = x[:,:,0:self.n_disc].long().to(device)
-        # print(x_disc.shape)
         x_nums = x[:,:,self.n_disc:self.n_disc+self.n_nums].to(device)
 
         ####### Addition Approach
@@ -110,8 +109,6 @@ class Embedding_data(nn.Module):
 
         # Process individual embeddings and sum them
         if self.n_disc > 0:
-            # print(len(self.embeddings_list))
-            # print(x_emb_sum.shape)
             for i, embedding in enumerate(self.embeddings_list):
                 x_emb_sum += embedding(x_disc[:, :, i])  # Element-wise addition instead of concatenation
 
@@ -137,7 +134,6 @@ class Embedding_data(nn.Module):
         x_emb_sum = torch.cat([x_emb_sum,x_emb_special],dim=2)
         
         final_emb = self.mlp_output(x_emb_sum)
-        # print(f"final_emb.shape:{final_emb.shape}")
         return final_emb
 
 ################################################################################################################
@@ -218,13 +214,6 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim):
         super().__init__()
-        self.decoder_rnn = nn.GRU(hidden_size, hidden_size, num_layers, batch_first=True, dropout= 0.1, 
-                                  bidirectional = bidirectional
-                                  )
-        # For bidirenctional
-        self.norm_rnn = nn.LayerNorm(hidden_size * (2 if bidirectional else 1))
-        self.fc_rnn = nn.Linear(hidden_size * (2 if bidirectional else 1),hidden_size)
-
         self.decoder_mlp = nn.Sequential(nn.Linear(lat_dim, hidden_size),
                                          nn.ReLU(),
                                          nn.Linear(hidden_size, hidden_size))
@@ -242,39 +231,36 @@ class Decoder(nn.Module):
 
         self.masks_linear = nn.Linear(hidden_size, 2)  # Try softmax
         self.missings_linear = nn.Linear(hidden_size, n_nums) 
+        self.times_linear = None
     
     def forward(self, latent_feature):
         decoded_outputs = dict()
-        latent_feature = self.decoder_mlp(latent_feature)
-
-        # latent_rnn, _ = self.decoder_rnn(latent_feature)
-        # latent_rnn = self.fc_rnn(self.norm_rnn(latent_rnn))
-        # latent_feature = latent_feature + latent_rnn
+        x = self.decoder_mlp(latent_feature)
 
         # Compute EOS mask
-        if True:
+        if self.masks_linear is not None:
             ## Use softmax
-            decoded_outputs['eos'] = self.masks_linear(latent_feature)
+            decoded_outputs['eos'] = self.masks_linear(x)
             eos_probabilities = F.softmax(decoded_outputs['eos'], dim=-1)[...,1]
             # Compute the cumulative mask: set to 0 after the first EOS in each sequence
             eos_predictions = (eos_probabilities > 0.5).int()  # Binary EOS predictions (B, L)
             eos_cumsum = eos_predictions.cumsum(dim=1).cumsum(dim=1)  # Cumulative sum along the sequence length
             eos_mask = (eos_cumsum <= 1).float().unsqueeze(-1)  # Mask: 1 before and at first EOS, 0 after
 
-        if True:
-            decoded_outputs['missings'] = self.missings_linear(latent_feature) * eos_mask
+        if self.missings_linear is not None:
+            decoded_outputs['missings'] = self.missings_linear(x) * eos_mask
 
-        if self.bins_linear:
-            decoded_outputs['bins'] = self.bins_linear(latent_feature) * eos_mask # * eos_mask if wants to get an masked sequence
+        if self.bins_linear is not None:
+            decoded_outputs['bins'] = self.bins_linear(x) * eos_mask
 
-        if self.cats_linears:
-            decoded_outputs['cats'] = [linear(latent_feature) * eos_mask for linear in self.cats_linears]
+        if self.cats_linears is not None:
+            decoded_outputs['cats'] = [linear(x) * eos_mask for linear in self.cats_linears]
 
-        if self.nums_linear:
-            decoded_outputs['nums'] = self.sigmoid(self.nums_linear(latent_feature)) * eos_mask
+        if self.nums_linear is not None:
+            decoded_outputs['nums'] = self.sigmoid(self.nums_linear(x)) * eos_mask
 
-        if False:
-            decoded_outputs['times'] = self.sigmoid(self.times_linear(latent_feature)) * eos_mask
+        if self.times_linear is not None:
+            decoded_outputs['times'] = None
 
         return decoded_outputs
 
@@ -329,18 +315,14 @@ def auto_loss(inputs, time_info, missing, masking, reconstruction, n_bins, n_num
     cats = inputs[:,:,n_bins:n_bins+n_cats].long()
     nums = inputs[:,:,n_bins+n_cats:n_bins+n_cats+n_nums]
     time_info = time_info
-
-    if True:
-        # missing_bins = 1. - missing[:,:,0:n_bins]
-        # missing_cats = 1. - missing[:,:,n_bins:n_bins+n_cats]
-        missing_nums = 1. - missing[...,-n_nums:]
+    missing_nums = 1. - missing[...,-n_nums:]
 
     eos = masking[:, :, -2] if masking is not None else torch.zeros(B, L, device=device)
     padding = masking[:, :, -1] if masking is not None else torch.zeros(B, L, device=device)
     real_mask = (padding < 1).float() if masking is not None else torch.ones(B, L, device=device)
 
     #reconstruction_losses = dict()
-    disc_loss = 0; num_loss = 0;
+    disc_loss = 0; num_loss = 0; first_visit_scale = 10.0
     
     if 'bins' in reconstruction:
         # BCE with logits => shape (B, L, n_bins) if reduction='none'
@@ -351,6 +333,10 @@ def auto_loss(inputs, time_info, missing, masking, reconstruction, n_bins, n_num
         bce_per_timestep = bce.sum(dim=-1)  # shape (B, L)
         # Apply real_mask
         masked_bce = bce_per_timestep * real_mask  # shape (B, L)
+        if first_visit_scale > 1.0:
+            # upweight the first visit(L=0) loss
+            first_visit_mask = (torch.arange(L, device=device) == 0).float()
+            masked_bce = masked_bce * (1.0 + first_visit_scale * first_visit_mask)
         # Now average only over real steps
         disc_loss += masked_bce.sum() / (real_mask.sum() + 1e-8)
 
@@ -389,6 +375,10 @@ def auto_loss(inputs, time_info, missing, masking, reconstruction, n_bins, n_num
             ce_2d = ce.view(B, L)
             # Apply mask
             ce_masked = ce_2d * real_mask  # shape (B, L)
+            if first_visit_scale > 1.0:
+                # upweight the first visit(L=0) loss
+                first_visit_mask = (torch.arange(L, device=device) == 0).float()
+                ce_masked = ce_masked * (1.0 + first_visit_scale * first_visit_mask)
             # Average over real positions
             cat_loss_i = ce_masked.sum() / (real_mask.sum() + 1e-8)
             cats_losses.append(cat_loss_i)
@@ -404,8 +394,30 @@ def auto_loss(inputs, time_info, missing, masking, reconstruction, n_bins, n_num
         mse_per_timestep = mse.sum(dim=-1)
         # Mask out padded timesteps
         masked_mse = mse_per_timestep * real_mask
+        if first_visit_scale > 1.0:
+            # upweight the first visit(L=0) loss
+            first_visit_mask = (torch.arange(L, device=device) == 0).float()
+            masked_mse = masked_mse * (1.0 + first_visit_scale * first_visit_mask)
         # Average over real positions
         num_loss += masked_mse.sum() / (real_mask.sum() + 1e-8)
+
+    if 'times' in reconstruction:
+        # MAE => shape (B, L, n_times) if reduction='none'
+        mae = F.l1_loss(reconstruction['times'], time_info, reduction='none') ## MSE is not working, KL exploded, L1 loss bad results
+        mae_per_timestep = mae.sum(dim=-1)
+        # Mask out padded timesteps
+        masked_mae = mae_per_timestep * real_mask
+        # Average over real positions
+        num_loss += masked_mae.sum() / (real_mask.sum() + 1e-8)
+
+        ## Cosine similarity loss for time reconstruction #using cosine only also bad results, but it is more stable than MSE
+        pred = reconstruction['times'].view(B, L, -1, 2)
+        target = time_info.view(B, L, -1, 2)
+        cos_sim = F.cosine_similarity(pred, target, dim=-1, eps=1e-8)  # (B, L, n_cycles)
+        cos_loss = 1 - cos_sim
+        cos_loss = cos_loss.mean(dim=-1)
+        masked_cos = cos_loss * real_mask
+        num_loss += 0.3 * masked_cos.sum() / (real_mask.sum() + 1e-8)
 
 
     return disc_loss, num_loss
@@ -437,8 +449,8 @@ def load_checkpoint(model, optimizer, CHECKPOINT_DIR, checkpoint_path=None,train
 
             model.load_state_dict(checkpoint['model_state_dict'],strict=False)
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch']
             best_loss = checkpoint['loss']
+            start_epoch = checkpoint['epoch'] + 1
 
             print(f"🔄 Loaded checkpoint from {checkpoint_path} (Epoch {start_epoch}) with Best Loss:{best_loss}")
             return start_epoch, best_loss

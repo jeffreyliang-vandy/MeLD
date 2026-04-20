@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 from numpy.lib.stride_tricks import sliding_window_view
-from . import process_edited as pce
+import models.MeLD.model.process_edited as pce
 from sklearn.preprocessing import MinMaxScaler
 
 __all__ = ['cyclical_encode', 'inverse_cyclical_encoding', 'partition_multi_seq', 'splitData', 'splitTimeData', 'normalize', 'inverse_normalize']
@@ -12,7 +12,7 @@ __all__ = ['cyclical_encode', 'inverse_cyclical_encoding', 'partition_multi_seq'
 # Cyclical Encoding (Optimized Vectorization)
 # ==========================================
 
-def cyclical_encode(df, year_period=150, month_period=12, day_period=365, hour_period=24):
+def cyclical_encode(df, year_period=150, month_period=12, day_period=366, hour_period=24):
     """Encodes datetime features using direct vectorized numpy operations."""
     res = df.copy()
     res['date'] = pd.to_datetime(res['date'])
@@ -37,34 +37,52 @@ def cyclical_encode(df, year_period=150, month_period=12, day_period=365, hour_p
     
     return res
 
-def inverse_cyclical_encoding(tensor, reference_year=2023, year_period=150, month_period=12, day_period=365, hour_period=24):
-    """Reverse the cyclical encoding process using pure numpy arrays."""
+
+def inverse_cyclical_encoding(tensor, reference_year=2023, year_period=150, month_period=12, day_period=366, hour_period=24):
+    """Corrected reverse cyclical encoding."""
     tensor = tensor.cpu().numpy() if isinstance(tensor, torch.Tensor) else tensor
-    
-    # Reshape to (N * sequence_length, 8)
     tensor = tensor.reshape(-1, 8)
     df = pd.DataFrame(tensor, columns=['year_sin', 'year_cos', 'month_sin', 'month_cos', 'day_sin', 'day_cos', 'hour_sin', 'hour_cos'])
 
     def inverse_transform(sin_arr, cos_arr, period):
+        # Result is in range [0, period)
         return (np.arctan2(sin_arr, cos_arr) / (2 * np.pi) * period) % period
 
     if year_period is not None:
-        df['year'] = reference_year + inverse_transform(df['year_sin'], df['year_cos'], year_period).astype(int) - (year_period // 2)
+        # 1. Get the decoded remainder (e.g., 73 for the year 2023 if period is 150)
+        decoded_mod = np.round(inverse_transform(df['year_sin'], df['year_cos'], year_period))
+        
+        # 2. Find the year closest to reference_year that has this remainder
+        # We calculate the shortest distance between the decoded remainder and the reference's remainder
+        ref_mod = reference_year % year_period
+        diff = (decoded_mod - ref_mod) % year_period
+        # Adjust for wrapping (if diff is 149, it's actually -1)
+        diff = np.where(diff > year_period / 2, diff - year_period, diff)
+        df['year'] = (reference_year + diff).astype(int)
 
     if month_period is not None:
-        df['month'] = inverse_transform(df['month_sin'], df['month_cos'], month_period).astype(int) + 1 
+        v = np.round(inverse_transform(df['month_sin'], df['month_cos'], month_period))
+        # Since encoding was (1 to 12), decoding gives (1 to 11, and 0 for 12).
+        # We map 0 back to 12.
+        df['month'] = np.where(v == 0, month_period, v).astype(int)
 
     if day_period is not None:
-        df['day_of_year'] = inverse_transform(df['day_sin'], df['day_cos'], day_period).astype(int) + 1 
+        v = np.round(inverse_transform(df['day_sin'], df['day_cos'], day_period))
+        # Same logic: if decoding 366/366, we get 0. Map 0 back to 366.
+        df['day_of_year'] = np.where(v == 0, day_period, v).astype(int)
 
     if hour_period is not None:
-        df['hour'] = inverse_transform(df['hour_sin'], df['hour_cos'], hour_period).astype(int)
+        v = np.round(inverse_transform(df['hour_sin'], df['hour_cos'], hour_period))
+        # Hours are 0-23, so standard rounding works.
+        df['hour'] = (v % hour_period).astype(int)
 
-    if {'year', 'month', 'day_of_year', 'hour'}.issubset(df.columns):
-        df['date'] = pd.to_datetime(df['year'].astype(str) + '-' + df['day_of_year'].astype(str), format='%Y-%j')
-        df['date'] += pd.to_timedelta(df['hour'], unit='h')
+    # Combine back to datetime
+    # We use Year and Day of Year for maximum accuracy
+    df['date'] = pd.to_datetime(df['year'].astype(str) + '-' + df['day_of_year'].astype(int).astype(str), format='%Y-%j')
+    df['date'] += pd.to_timedelta(df['hour'], unit='h')
 
     return df[['date']].reset_index(drop=True)
+
 
 # ==========================================
 # Partition Processing (Loop Fusion & Speedups)

@@ -87,7 +87,8 @@ def process_epoch(epoch, data_loader, model, optimizer, accelerator, args, beta,
 
     # Calculate beta for warmup
     if args.warmup > 0 and epoch < args.warmup:
-        beta = min(args.max_beta, args.max_beta * epoch / args.warmup)
+        # beta = min(args.max_beta, args.max_beta * epoch / args.warmup)
+        beta = args.max_beta
 
     num_batches = len(data_loader)
     batch_start_time = time.time()
@@ -96,9 +97,9 @@ def process_epoch(epoch, data_loader, model, optimizer, accelerator, args, beta,
         # 1. Record how long we waited for the dataloader (CPU -> GPU bottleneck)
         per_batch_data_time = time.time() - batch_start_time
         data_time_total += per_batch_data_time
-        # print(f"Data time total: {data_time_total}")
         
         # 2. Start compute timer
+        torch.cuda.synchronize()
         compute_start_time = time.time()
 
         if is_train:
@@ -122,6 +123,7 @@ def process_epoch(epoch, data_loader, model, optimizer, accelerator, args, beta,
         total_kl += avg_KL
         
         # Record compute time
+        torch.cuda.synchronize()
         per_batch_compute_time = time.time() - compute_start_time
         compute_time_total += per_batch_compute_time
 
@@ -245,13 +247,17 @@ def main():
         train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
         per_gpu_batch_size = max(1, args.batch_size // accelerator.num_processes)
-        train_loader = DataLoader(train_dataset, shuffle=True, batch_size=per_gpu_batch_size, num_workers=4, prefetch_factor=4, pin_memory=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, shuffle=False, batch_size=per_gpu_batch_size, num_workers=4, prefetch_factor=4, pin_memory=True, drop_last=False)
+        train_loader = DataLoader(train_dataset, shuffle=True, batch_size=per_gpu_batch_size, num_workers=4, prefetch_factor=4,persistent_workers=True, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, shuffle=False, batch_size=per_gpu_batch_size, num_workers=4, prefetch_factor=4, persistent_workers=True, pin_memory=True, drop_last=False)
 
         main_log("Initializing Modules...")
-
         ae = tae.DeapStack(**model_config) 
-        optimizer_ae = Adam(ae.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer_ae = Adam(ae.parameters(), 
+                            lr=args.lr, 
+                            weight_decay=args.weight_decay)
+        total_params = sum(p.numel() for p in ae.parameters())        
+        main_log(f"{total_params/1e6:.1f}M parameters")
+        main_log(f"lr: {args.lr} - weight_decay: {args.weight_decay}")
         
         ae, optimizer_ae, train_loader, val_loader = accelerator.prepare(
             ae, optimizer_ae, train_loader, val_loader
@@ -262,14 +268,14 @@ def main():
         best_loss = float('inf')
         max_beta = args.max_beta
         beta = max_beta
-        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/10), ratio=0.8)
+        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/5), ratio=0.8)
         patience = 0
 
         unwrapped_ae = accelerator.unwrap_model(ae)
         past_epoch, best_loss = tae.load_checkpoint(unwrapped_ae, optimizer_ae, args.checkpoint_dir)
         main_log(f"Best loss from checkpoint: {best_loss}")
 
-        for epoch in range(args.epochs):
+        for epoch in range(past_epoch,args.epochs):
             # Train & Validate (now returning timing stats too)
             train_loss, train_re, train_kl, tr_data_time, tr_comp_time = process_epoch(epoch, train_loader, ae, optimizer_ae, accelerator, args, beta, is_train=True)
             
@@ -298,10 +304,10 @@ def main():
                 else:
                     patience += 1
                     if patience > args.patience and max_beta > args.min_beta:
-                        max_beta = max(max_beta * 0.7, args.min_beta)
+                        max_beta = max(max_beta * 0.5, args.min_beta)
                         main_log(f"Patience > {args.patience}. Reducing max_beta to: {max_beta:.6f}")
-                        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/10), ratio=0.8)
-                        # patience = 0
+                        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/5), ratio=0.8)
+                        patience = 0
                     if patience > args.early_stop_patience:
                         main_log(f"Patience > {args.early_stop_patience}. Triggering early stopping.")
                         break
@@ -332,7 +338,7 @@ def main():
     ae = accelerator.prepare(unwrapped_ae)
     ae.eval()
 
-    sample_loader = DataLoader(IndexedDataset(dataset), batch_size=args.batch_size, shuffle=False, num_workers=8, prefetch_factor=2, pin_memory=True, drop_last=False)
+    sample_loader = DataLoader(IndexedDataset(dataset), batch_size=args.batch_size, shuffle=False, num_workers=4, prefetch_factor=2, pin_memory=True, drop_last=False)
     sample_loader = accelerator.prepare(sample_loader)
 
     emb_list, idxs_list = [], []

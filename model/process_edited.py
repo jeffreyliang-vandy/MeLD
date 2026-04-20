@@ -2,31 +2,169 @@ import torch
 import numpy as np
 from collections import Counter
 import pandas as pd
-from tqdm.auto import tqdm
+from tqdm import tqdm
+from scipy.stats import yeojohnson
 
 __all__ = ['StandardScaler', 'LabelEncoder', 'FreqLabelEncoder', 'DataFrameParser', 'convert_to_tensor', 'convert_to_table']
 
 class StandardScaler(object):
-    def __init__(self):
-        self.max = None
-        self.min = None
-        self.scale = None
+    """
+    1. Detect skewness
+    2. Apply Yeo-Johnson only if data is sufficiently skewed
+    3. Min-max scale to [0, 1]
+    4. Inverse transform recovers the original data
+
+    Parameters
+    ----------
+    skew_threshold : float
+        Only apply Yeo-Johnson if abs(skewness) > skew_threshold.
+    eps : float
+        Small value to avoid division by zero.
+    """
+
+    def __init__(self, skew_threshold=0.5, eps=1e-16):
+        self.skew_threshold = skew_threshold
+        self.eps = eps
+
+        self.use_yeojohnson = False
+        self.lmbda = None
+        self.min_ = None
+        self.max_ = None
+        self.scale_ = None
 
     def fit(self, x):
-        self.max, self.min = np.nanmax(x), np.nanmin(x)
-        self.scale = self.max - self.min
-        if self.scale == 0: self.scale = 1e-16
+        x = np.asarray(x, dtype=float)
+        valid = ~np.isnan(x)
+
+        if not np.any(valid):
+            raise ValueError("Input contains only NaN values.")
+
+        x_valid = x[valid]
+        self.clip_min_, self.clip_max_ = np.quantile(x_valid, [0.001,0.999])
+        x_valid = np.clip(x_valid, self.clip_min_, self.clip_max_)
+        skew = self._skewness(x_valid)
+
+        if abs(skew) > self.skew_threshold:
+            x_transformed, lmbda = yeojohnson(x_valid)
+            new_skew = self._skewness(x_transformed)
+
+            # only keep transform if it improves symmetry
+            if abs(new_skew) < abs(skew):
+                self.use_yeojohnson = True
+                self.lmbda = lmbda
+                x_fit = x_transformed
+            else:
+                self.use_yeojohnson = False
+                self.lmbda = None
+                x_fit = x_valid
+        else:
+            self.use_yeojohnson = False
+            self.lmbda = None
+            x_fit = x_valid
+
+        self.min_ = np.min(x_fit)
+        self.max_ = np.max(x_fit)
+        self.scale_ = self.max_ - self.min_
+
+        if self.scale_ < self.eps:
+            self.scale_ = self.eps
+
         return self
 
     def transform(self, x):
-        standardized = (np.array(x) - self.min) / self.scale
-        return np.nan_to_num(standardized)
-    
+        self._check_is_fitted()
+
+        x = np.asarray(x, dtype=float)
+        out = x.copy()
+
+        valid = ~np.isnan(out)
+        if np.any(valid):
+            if self.use_yeojohnson:
+                out[valid] = self._yeojohnson_transform(out[valid], self.lmbda)
+
+            out[valid] = (out[valid] - self.min_) / self.scale_
+            out[valid] = np.clip(out[valid], 0.0, 1.0)
+
+        return out
+
     def fit_transform(self, x):
         return self.fit(x).transform(x)
 
-    def inverse_transform(self, encoded_col):
-        return np.multiply(encoded_col, self.scale) + self.min
+    def inverse_transform(self, x_scaled):
+        self._check_is_fitted()
+
+        x_scaled = np.asarray(x_scaled, dtype=float)
+        out = x_scaled.copy()
+
+        valid = ~np.isnan(out)
+        if np.any(valid):
+            out[valid] = out[valid] * self.scale_ + self.min_
+
+            if self.use_yeojohnson:
+                out[valid] = self._yeojohnson_inverse(out[valid], self.lmbda)
+
+        return out
+
+    @staticmethod
+    def _skewness(x):
+        x = np.asarray(x, dtype=float)
+        std = np.std(x)
+        if std < 1e-16:
+            return 0.0
+        mean = np.mean(x)
+        return np.mean(((x - mean) / std) ** 3)
+
+    @staticmethod
+    def _yeojohnson_transform(x, lmbda):
+        """
+        Apply Yeo-Johnson transform with a fixed lambda.
+        scipy.stats.yeojohnson estimates lambda, but does not expose
+        a direct 'transform with existing lambda' API, so we implement it here.
+        """
+        x = np.asarray(x, dtype=float)
+        out = np.empty_like(x)
+
+        pos = x >= 0
+        neg = ~pos
+
+        if np.isclose(lmbda, 0.0):
+            out[pos] = np.log1p(x[pos])
+        else:
+            out[pos] = ((x[pos] + 1.0) ** lmbda - 1.0) / lmbda
+
+        if np.isclose(lmbda, 2.0):
+            out[neg] = -np.log1p(-x[neg])
+        else:
+            out[neg] = -(((1.0 - x[neg]) ** (2.0 - lmbda)) - 1.0) / (2.0 - lmbda)
+
+        return out
+
+    @staticmethod
+    def _yeojohnson_inverse(y, lmbda):
+        """
+        Inverse Yeo-Johnson transform.
+        """
+        y = np.asarray(y, dtype=float)
+        out = np.empty_like(y)
+
+        pos = y >= 0
+        neg = ~pos
+
+        if np.isclose(lmbda, 0.0):
+            out[pos] = np.expm1(y[pos])
+        else:
+            out[pos] = (lmbda * y[pos] + 1.0) ** (1.0 / lmbda) - 1.0
+
+        if np.isclose(lmbda, 2.0):
+            out[neg] = 1.0 - np.exp(-y[neg])
+        else:
+            out[neg] = 1.0 - (1.0 - (2.0 - lmbda) * y[neg]) ** (1.0 / (2.0 - lmbda))
+
+        return out
+
+    def _check_is_fitted(self):
+        if self.min_ is None or self.scale_ is None:
+            raise ValueError("Scaler has not been fitted yet.")
 
 class LabelEncoder(object):
     def __init__(self):
