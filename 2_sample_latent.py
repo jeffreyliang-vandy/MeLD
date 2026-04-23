@@ -48,9 +48,10 @@ def main():
     parser.add_argument("--vae_model", "-VM", default=None, help="Model suffix name")
     parser.add_argument("--model_path", "-MP", required=True, help="Base directory for saved models")
     parser.add_argument("--data_path", "-DP", required=True, help="Path to HDF5 data to run inference on (e.g., test data)")
-    parser.add_argument("--condition_path", "-CP", default=None, type=str, help="Path to HDF5 data to run inference on (e.g., test data)")
+    parser.add_argument("--condition_path", "-CP", default=None, type=str, help="Path to parquet cohort data to run conditional inference on (e.g., test data)")
     parser.add_argument("--checkpoint", "-ckpt", type=str, default="", help="Specific epoch checkpoint to load, leave empty for best model")
     parser.add_argument("--batch_size", "-BS", type=int, default=128)
+    parser.add_argument("--sample_size", "-SS", type=int, required=False)
     args = parser.parse_args()
 
     # Define directories
@@ -95,10 +96,16 @@ def main():
 
     # --- 3. Inference Loop ---
     latent_list, idxs_list = [], []
+    total_batches = len(loader)
+    if args.sample_size:
+        print(f"Limiting inference to first {args.sample_size} samples.")
+        total_batches = (args.sample_size + args.batch_size - 1) // args.batch_size
+
+    loader = tqdm(loader, total=total_batches)
 
     print("Running Inference...")
     with torch.no_grad():
-        for data, time_info, missing, masking, idxs in tqdm(loader, total=len(loader)):
+        for i, (data, time_info, missing, masking, idxs) in enumerate(loader):
             # Move to device
             data, time_info = data.to(device), time_info.to(device)
             missing, masking = missing.to(device), masking.to(device)
@@ -109,6 +116,9 @@ def main():
             # Send latents to CPU and store
             latent_list.append(latent_batch.cpu())
             idxs_list.append(idxs.cpu())
+
+            if i >= total_batches:
+                break
 
     # --- 4. Concatenate and Restore Order ---
     print("Concatenating and sorting results by original index...")
