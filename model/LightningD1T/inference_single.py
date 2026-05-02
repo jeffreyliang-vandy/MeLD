@@ -23,9 +23,15 @@ The YAML must contain:
 import os, math, yaml, argparse, json, logging, torch
 from time import strftime
 from tqdm import tqdm
+import numpy as np
+import pandas as pd
 
 from models.lightning1dit import LightningDiT_models
 from transport import create_transport, Sampler
+from datasets.real_dataset import ConditionDataset
+from datasets.condition2text import generate_text_conditions
+from torch.utils.data import DataLoader
+
 
 
 # ------------------------------------------------------------------ #
@@ -95,6 +101,20 @@ def sample(cfg):
     os.makedirs(out_dir, exist_ok=True)
     log(f"Saving tensors to {out_dir}")
 
+    # ---------------------------  data  ---------------------------- #
+    condition_path = cfg["sample"].get("cond_path", None)
+    if condition_path is not None:
+        log(f"Loading conditional dataset... at {condition_path}")
+        dataset = ConditionDataset(data_dir=condition_path)
+        loader = DataLoader(
+            dataset,
+            batch_size=cfg["sample"]["batch_size"],
+            shuffle=True,
+            num_workers=cfg["data"].get("num_workers", 0),
+            pin_memory=True,
+            drop_last=True,
+        )
+
     # --------------------------- generate -------------------------- #
     total      = cfg["sample"]["total"]
     batch_size = cfg["sample"]["batch_size"]
@@ -104,6 +124,7 @@ def sample(cfg):
     steps = math.ceil(total / batch_size)
     idx   = 0
     sample_list = list()
+    condition_list = list()
 
     for _ in tqdm(range(steps), total=steps):
         m = min(batch_size, total - idx)
@@ -114,8 +135,14 @@ def sample(cfg):
         # classifier‑free guidance
         if use_cfg:
             z = torch.cat([z, z], 0)
-            # no conditioning labels → just duplicate; y ignored inside model
-            model_kwargs = dict(cfg_scale=cfg_scale,
+            indices = np.random.choice(len(loader.dataset), m)
+            condition_list.extend(indices)
+            y = [loader.dataset[i] for i in indices]  # list of conditions
+            y = generate_text_conditions(y,dropout_rate=0.0)
+            y_null = [""] * m  # empty conditions
+            y = y + y_null
+            model_kwargs = dict(y = y,
+                                cfg_scale=cfg_scale,
                                 cfg_interval=False,
                                 cfg_interval_start=0.0)
             model_fn = model.forward_with_cfg
@@ -125,14 +152,28 @@ def sample(cfg):
 
         samples = sample_fn(z, model_fn, **model_kwargs)[-1]
         if use_cfg:
-            samples, _ = samples.chunk(2, 0)
+            samples, _ = samples.chunk(2, 0) # remove null class samples
 
         ## save
         sample_list.append(samples.cpu().permute(0, 2, 1))
 
     log("Sampling done.")
-    torch.save(torch.concat(sample_list,dim=0),os.path.join(out_dir, "samples.pt"))
-
+    sample = torch.concat(sample_list,dim=0)[:total]
+    del sample_list
+    ## evaluate fvd
+    
+    torch.save(sample,os.path.join(out_dir, "samples.pt"))
+    ## save conditions used if any
+    if len(condition_list) > 0:
+        conditions = [dataset.cond_data[i] for i in condition_list]
+        conditions = pd.DataFrame(
+            [
+                dict(item.split(": ", 1) for item in row) 
+                for row in conditions
+            ]
+        )
+        conditions[:total].to_csv(os.path.join(out_dir, "conditions.csv.gz"),compression="gzip", index=False)
+    log(f"Saved {total} samples to {out_dir}")
 
 # ------------------------------------------------------------------ #
 #                            entry                                   #

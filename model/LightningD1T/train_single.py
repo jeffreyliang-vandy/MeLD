@@ -15,6 +15,7 @@ from glob import glob
 from time import time
 from copy import deepcopy
 from collections import OrderedDict
+from datasets.condition2text import generate_text_conditions
 
 import torch
 from torch.utils.data import DataLoader
@@ -26,7 +27,7 @@ from tqdm import tqdm
 # --------------------------------------------------------------------- #
 from models.lightning1dit import LightningDiT_models
 from transport import create_transport
-from datasets.real_dataset import LatentDataset      # <- your loader
+from datasets.real_dataset import LatentDataset     # <- your loader
 
 
 # ------------------------------ utils -------------------------------- #
@@ -37,6 +38,7 @@ def load_config(path):
 
 def create_logger(save_dir):
     os.makedirs(save_dir, exist_ok=True)
+    os.remove(os.path.join(save_dir, "log.txt")) if os.path.exists(os.path.join(save_dir, "log.txt")) else None
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(message)s",
@@ -119,7 +121,12 @@ def train(cfg):
     )
 
     # data ------------------------------------------------------------- #
-    dataset = LatentDataset(cfg["data"]["data_path"], channel_first=True)
+    logger.info("Loading dataset...")
+    dataset = LatentDataset(data_dir = cfg["data"]["data_path"], 
+                            cond_dir = cfg["data"].get("cond_path", None),
+                            dtype=torch.float32,
+                            channel_first=True)
+
     loader = DataLoader(
         dataset,
         batch_size=cfg["train"]["global_batch_size"],
@@ -146,13 +153,18 @@ def train(cfg):
     grad_clip = cfg["optimizer"].get("max_grad_norm", None)
 
     while step < max_steps:
-        for x, _ in loader:
+        for x, y in loader:
             x = x.to(device)
+            if isinstance(y, torch.Tensor):
+                model_kwargs = {}
+            else:
+                y = generate_text_conditions([list(sample_attrs) for sample_attrs in zip(*y)])
+                model_kwargs = dict(y=y)
 
             # noise scheduling etc. is inside transport.training_losses
             # with torch.cuda.amp.autocast(enabled=mixed_precision,dtype=torch.bfloat16):
             with torch.cuda.amp.autocast(enabled=mixed_precision):
-                loss_dict = transport.training_losses(model, x, {})
+                loss_dict = transport.training_losses(model, x, model_kwargs)
                 loss = loss_dict["loss"].mean()
 
             opt.zero_grad(set_to_none=True)

@@ -13,6 +13,8 @@ import os
 from glob import glob
 import torch
 from torch.utils.data import Dataset
+import pandas as pd
+import numpy as np
 
 
 class LatentDataset(Dataset):
@@ -21,12 +23,15 @@ class LatentDataset(Dataset):
                  latent_norm: bool = True,
                  latent_multiplier: float = 1.0,
                  channel_first: bool = True,
-                 dtype: torch.dtype = torch.float32) -> None:
+                 dtype: torch.dtype = torch.float32,
+                 cond_dir: str = None) -> None:
         """
         Parameters
         ----------
         data_dir : str
             Directory that contains exactly one .pt file with shape (N,L,C).
+        cond_dir : str
+            Path to the tabular conditions CSV file.
         channel_first : bool
             If True, returned tensors are (C,L); otherwise (L,C).
         dtype : torch.dtype
@@ -43,6 +48,7 @@ class LatentDataset(Dataset):
         # ------------------------------------------------------------------ #
         # 2. Load the entire tensor into RAM                                  #
         # ------------------------------------------------------------------ #
+        print(f"Loading data from {self.file_path}...")
         data = torch.load(self.file_path, map_location="cpu").to(dtype)  # (N,L,C)
         assert data.dim() == 3, "Expected tensor of shape (N, seq_len, C)."
         self.N, self.L, self.C = data.shape
@@ -67,6 +73,24 @@ class LatentDataset(Dataset):
         self.data = data  # keep in memory
         self.dtype = dtype
 
+        if cond_dir is not None:
+            print(f"Loading conditions from {cond_dir}...")
+            if cond_dir.endswith(".csv.gz") or cond_dir.endswith(".csv"):
+                cond_data = pd.read_csv(cond_dir).reset_index(drop=True)
+            elif cond_dir.endswith(".parquet"):
+                cond_data = pd.read_parquet(cond_dir).reset_index(drop=True)
+            # Check for mismatch
+            if len(cond_data) != self.N:
+                raise ValueError(f"Dataset mismatch: .pt file has {self.N} samples, "
+                                f"but CSV has {len(cond_data)} samples.")
+            self.cond_data = [
+                    [f"{col}: {val}" for col, val in row.items()] 
+                    for _, row in cond_data.iterrows()
+                ]
+            assert len(self.cond_data) == self.N, "Condition data length mismatch."
+        else:
+            self.cond_data = None
+
     # ---------------------------------------------------------------------- #
     #               PyTorch Dataset protocol                                  #
     # ---------------------------------------------------------------------- #
@@ -81,5 +105,60 @@ class LatentDataset(Dataset):
         y : torch.LongTensor  scalar row id
         """
         x = self.data[idx]                                # view into RAM
-        y = torch.tensor(idx, dtype=torch.long)
+        if self.cond_data is not None:
+            y = self.cond_data[idx]
+        else:
+            y = torch.tensor(idx, dtype=torch.long)
+        
         return x, y
+
+
+class ConditionDataset(Dataset):
+    def __init__(self,
+                 data_dir: str = None) -> None:
+        """
+        Parameters
+        ----------
+        data_dir : str
+            Path to the tabular conditions CSV file.
+        """
+        super().__init__()
+
+        # ------------------------------------------------------------------ #
+        # 1. Locate the unique .csv file                                       #
+        # ------------------------------------------------------------------ 
+        if data_dir is not None:
+            print(f"Loading conditions from {data_dir}...")
+            if data_dir.endswith(".csv"):
+                cond_data = pd.read_csv(data_dir).reset_index(drop=True)
+            elif data_dir.endswith(".parquet"):
+                cond_data = pd.read_parquet(data_dir).reset_index(drop=True)
+            self.cond_data = [
+                    [f"{col}: {val}" for col, val in row.items()] 
+                    for _, row in cond_data.iterrows()
+                ]
+            self.N = len(self.cond_data)
+        else:
+            self.cond_data = None
+            self.N = 0
+
+    # ---------------------------------------------------------------------- #
+    #               PyTorch Dataset protocol                                  #
+    # ---------------------------------------------------------------------- #
+    def __len__(self) -> int:
+        return self.N
+
+    def __getitem__(self, idx: int):
+        """
+        Returns
+        -------
+        x : torch.Tensor  (C,L) if channel_first else (L,C)
+        y : torch.LongTensor  scalar row id
+        """
+        if self.cond_data is not None:
+            y = self.cond_data[idx]
+        else:
+            y = [""] # empty string if no conditions
+        
+        return y
+
