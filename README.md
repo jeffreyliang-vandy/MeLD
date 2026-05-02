@@ -7,6 +7,8 @@ Moreiraa, Fabio Paredes, Jordany Bernadin, Diana Varela, Carina Cesar, Alessandr
 Blasimme, Jessica M. Perkins, Amir Asiaee, Stephany N. Duda, Bradley A.
 Malin, Bryan E. Shepherd, and Chao Yan
 
+\[[Medrxiv](https://www.medrxiv.org/content/10.1101/2025.11.14.25340245v1)\]
+
 A collection of scripts and model implementations for learning latent representations from longitudinal medical data and generating synthetic patient time series using a VAE + DiT (Diffusion Transformer) pipeline.
 
 **Update (2024-06):** 
