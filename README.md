@@ -9,12 +9,17 @@ Malin, Bryan E. Shepherd, and Chao Yan
 
 A collection of scripts and model implementations for learning latent representations from longitudinal medical data and generating synthetic patient time series using a VAE + DiT (Diffusion Transformer) pipeline.
 
+**Update (2024-06):** 
+- MeLD is now updated to support more general longitudinal data. 
+- Now support CFG (Classifier-Free Guidance) generation, with CLIP as encoder to encode condtions as text embeddings.
+
+
 ## Repository layout (important files)
 - `model/timeautoencoder.py` - VAE model definitions and utilities
-- `model/LightningDiT/` — Diffusion Transformer implementation and training utilities
+- `model/LightningD1T/` — Diffusion Transformer implementation and training utilities
 - `1_train_vae.py` — Train a VAE on your dataset and save model checkpoints
 - `2_sample_latent.py` — Encode data into latent representations using a trained VAE
-- `3_train_DiT.sh` — Wrapper to train LightningDiT on latent samples (requires a config in `LightningDiT/configs/`)
+- `3_train_DiT.sh` — Wrapper to train LightningDiT on latent samples (requires a config in `LightningD1T/configs/`)
 - `4_sample_synthetic_data.py` — Convert generated latent samples back into original data space
 - `evaluation/` — Metrics and evaluation scripts used in the paper
 - `baseline/` — Bundled baseline models used by the pipeline
@@ -25,14 +30,14 @@ A collection of scripts and model implementations for learning latent representa
 ### Prerequisites
 
 - Python 3.8+ (conda or venv recommended)
-- PyTorch compatible with your CUDA / CPU setup (see `LightningDiT/requirements.txt`)
+- PyTorch compatible with your CUDA / CPU setup (see `LightningD1T/requirements.txt`)
 
 Install dependencies (example using a virtualenv):
 
 ```bash
 # create and activate a venv
 conda create -n meld_vae -f model/environment.yaml
-conda create -n meld_dit -f model/LightningDiT/requirements.txt
+conda create -n meld_dit -f model/LightningD1T/requirements.txt
 ```
 
 ### Pipeline (order matters)
@@ -48,13 +53,13 @@ python 1_train_vae.py -VM your_vae_name
 
 ```bash
 conda run -n meld_vae \
-python 2_sample_latent.py -MV your_vae_name
+python 2_sample_latent.py -VM your_vae_name
 ```
 
 3) Train DiT on latent samples and generate latent synthetic samples
 
 ```bash
-# Make sure you create or edit a config under `LightningDiT/configs/`
+# Make sure you create or edit a config under `LightningD1T/configs/`
 conda run -n meld_dit bash 3_train_DiT.sh
 ```
 
@@ -71,7 +76,7 @@ python 4_sample_synthetic_data.py \
 
 ## Configuration notes
 
-- `model/LightningDiT/configs/` contains example configs used for training the DiT model. Copy and adapt those for your dataset and compute budget.
+- `model/LightningD1T/configs/` contains example configs used for training the DiT model. Copy and adapt those for your dataset and compute budget.
 - Data preprocessing can be found in `0_data_preprocessing.py`, and model-specific data logic can be found under `HALO_Inpatient/`, `SynTEG/`, `TimeDiff` and `TimeAutoDiff/` — review those scripts when preparing your dataset.
 - We provide baseline models code from 
     - LLM based model `HALO_Inpatient/`, 

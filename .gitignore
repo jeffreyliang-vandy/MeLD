@@ -2,3 +2,4 @@
 __pycache__
 *.pt*
 .git*
+model/LightningD1T/configs/*.yaml

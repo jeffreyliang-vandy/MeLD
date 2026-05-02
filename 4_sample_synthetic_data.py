@@ -1,250 +1,192 @@
 import os
-
-# Set the visible devices to only GPU 2
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-
-# Verify CUDA device visibility in PyTorch
-import torch
-print("Available CUDA devices:", torch.cuda.device_count())
-print("Using device:", torch.cuda.current_device())
-
-import numpy as np
-from model import timeautoencoder as tae
-from model import DP as dp
-import pandas as pd
-import numpy as np
-import time
-from model import process_edited as pce
+import gc
 import random
 import argparse
-from tqdm import tqdm
-from torch.utils.data import DataLoader, TensorDataset
+
+import numpy as np
+import pandas as pd
+import torch
 import torch.nn.functional as F
-from itertools import cycle
+from tqdm import tqdm
+import pickle
 
-args_parser = argparse.ArgumentParser()
-args_parser.add_argument("--conditional","-C",action="store_true")
-args_parser.add_argument("--n","-N",type=int,required=False)
-args_parser.add_argument("--save_dir","-S",type=str,default="/data/7TB/jeff/results/timeautodiff/")
-args_parser.add_argument("--seed",type=int,default=0)
-args_parser.add_argument("--model_name","-M",type=str,required=True)
-args_parser.add_argument("--vae_checkpoint","-V",type=str,default=None,required=False)
-args_parser.add_argument("--vae_model","-VM",type=str,default=None,required=False)
-args_parser.add_argument("--ddpm_latents_path","-DP",type=str,default=None,required=False)
-args_parser.add_argument("--scaled","-SL",action="store_true",default=False)
-args_parser.add_argument("--missing","-MS",action="store_true",default=False)
-args = args_parser.parse_args()
+from model import timeautoencoder as tae
+from model import DP as dp
+from model import process_edited as pce
 
-SEED = args.seed
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Generate tabular data from VAE latents.")
+    parser.add_argument("--n", "-N", type=int, required=False)
+    parser.add_argument("--save_dir", "-S", type=str, default="./save/generated/")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--model_name", "-M", type=str, required=True)
+    parser.add_argument("--vae_checkpoint", "-V", type=str, default=None, required=False)
+    parser.add_argument("--vae_model", "-VM", type=str, default=None, required=False)
+    parser.add_argument("--vae_path", "-VP", type=str, default=None, required=False)
+    parser.add_argument("--ddpm_latents_path", "-LP", type=str, default=None, required=False)
+    parser.add_argument("--scaled", "-SL", action="store_true", default=False)
+    parser.add_argument("--missing", "-MS", action="store_true", default=False)
+    parser.add_argument("--data_path", "-DP", type=str, default="/home/jeffrey/Documents/EA_project/data/dataset/ea_hiv/preprocessed/merged/train/parser.pkl")
+    
+    return parser.parse_args()
 
-##################################################################################################################
-# Pre-processing Data
-print("Loading Data...")
+def set_seeds(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-# filename = f'../Dataset/Multi-Sequence Data/nasdaq100_2019.csv'
-filename = f'../Dataset/hiv_train.csv.gz'
-# Read dataframe
-print(filename)
-real_df = pd.read_csv(filename).fillna(0)
+def main():
+    args = parse_arguments()
+    set_seeds(args.seed)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-real_df = real_df.drop(['patient_id','date'], axis=1)
+    print(f"Available CUDA devices: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"Using device: {torch.cuda.current_device()}")
 
-has_na = real_df.isna().any().any()
-print("Are there any missing values in the DataFrame? ", has_na)
-print(f"real_df.shape: {real_df.shape}")
+    os.makedirs(args.save_dir, exist_ok=True)
 
-os.makedirs(args.save_dir, exist_ok=True)
-##################################################################################################################
-print("Preprocess Data...")
-device = 'cuda'
+    # Set up the base VAE directory using args.vae_path if provided
+    if args.vae_path:
+        base_vae_path = args.vae_path
+    else:
+        vae_model_suffix = f"_{args.vae_model}" if args.vae_model else ""
+        base_vae_path = f"./save/vae{vae_model_suffix}"
 
-processed_data = torch.load("../Dataset/save/processed_data.pt")
-time_info = torch.load("../Dataset/save/shift_time_info.pt")
+    ckpt = f"_checkpoint_epoch_{args.vae_checkpoint}" if args.vae_checkpoint else ""
+    vae_latent_path = os.path.join(base_vae_path, f"latent_feature{ckpt}.pt")
 
-if args.vae_checkpoint is not None:
-    ckpt = f"_checkpoint_epoch_{args.vae_checkpoint}"
-else: ckpt = ""
+    # -------------------------------------------------------------------------
+    # 1. Load Latents
+    # -------------------------------------------------------------------------
+    print(f"\nLoading Latents at {args.ddpm_latents_path}...")
+    if not os.path.exists(args.ddpm_latents_path):
+        raise FileNotFoundError(f"❌ Latents file not found at {args.ddpm_latents_path}")
 
-if args.vae_model is not None:
-    vae_model = f"_{args.vae_model}"
-else: vae_model = ""
-
-VAE_CHECKPOINT = f"../Dataset/save/vae{vae_model}/latent_feature{ckpt}.pt"
-latent_features = torch.load(VAE_CHECKPOINT)
-
-print(f"preprocessed_data.shape: {processed_data.shape}")
-print(f"time_info.shape: {time_info.shape}")
-
-
-print(f"Loading Latents at {args.ddpm_latents_path}...")
-if os.path.exists(args.ddpm_latents_path):
     if args.ddpm_latents_path.endswith('.pt'):
-        samples = torch.load(args.ddpm_latents_path,map_location = 'cpu')
+        samples = torch.load(args.ddpm_latents_path, map_location='cpu')
     elif args.ddpm_latents_path.endswith('.npy'):
-        samples = np.load(args.ddpm_latents_path)
-        samples = torch.tensor(samples).cpu()
-    # ## Get a dummy
-    # samples = latent_features
-    del latent_features
+        samples = torch.tensor(np.load(args.ddpm_latents_path)).cpu()
 
     if not args.scaled:
-        # raise ValueError(f"Imported Samples must be inverse normalized from [-1,1] to original scales")
-        if samples.min()>=0: samples = samples * 2 - 1 ## [0,1] to [-1,1]
-        latent_features = torch.load(f"../Dataset/save/vae{vae_model}/latent_feature{ckpt}.pt")
+        if samples.min() >= 0: 
+            samples = samples * 2 - 1  # Map [0,1] to [-1,1]
+            
+        latent_features = torch.load(vae_latent_path)
         _, max_val, min_val = dp.normalize(latent_features)
-        samples = dp.inverse_normalize(samples,max_val,min_val)
+        samples = dp.inverse_normalize(samples, max_val, min_val)
         del latent_features
-else:
-    raise FileNotFoundError(f"❌ latents file not found at {args.ddpm_latents_path}")
 
-# Manually clear cache
-torch.cuda.empty_cache()
-import gc
-gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
 
-##################################################################################################################
-# Post-process the generated data 
-threshold = 1
-
-print("Load VAE model...")
-
-PARAMS_PATH = f"../Dataset/save/vae{vae_model}/vae_params.pth"
-# Load saved model parameters
-if os.path.exists(PARAMS_PATH):
-    model_params = torch.load(PARAMS_PATH, map_location=device)
-    print(f"✅ Model parameters loaded successfully from {PARAMS_PATH}")
-else:
-    raise FileNotFoundError(f"❌ Parameters file not found at {PARAMS_PATH}")
-
-ae = tae.DeapStack(**model_params).to(device)
-print("Loading Weights...")
-# Load trained model weights
-if args.vae_checkpoint is not None:
-    CHECKPOINT_PATH = f"../Dataset/save/vae{vae_model}/vae_checkpoint_epoch_{args.vae_checkpoint}.pth"
-else:
-    CHECKPOINT_PATH = f"../Dataset/save/vae{vae_model}/vae.pth"
-
-if os.path.exists(CHECKPOINT_PATH):
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-    ae.load_state_dict(checkpoint['model_state_dict'])
-    print(f"✅ Model weights loaded successfully from {CHECKPOINT_PATH}")
-else:
-    raise FileNotFoundError(f"❌ Model checkpoint not found at {CHECKPOINT_PATH}")
-
-# ae = torch.compile(ae)
-ae.eval()
-
-print("Post-process the generated data...")
-
-batch_size = 128  # Start small, increase if memory allows
-num_batches = samples.shape[0] // batch_size + int(samples.shape[0] % batch_size > 0)
-output_dict = {'bins': [], 'cats': [], 'nums': [],'times': [], 'eos': [], 'missings': []}
-with torch.no_grad():
-    for i in tqdm(range(num_batches), total=num_batches):
-        start = i * batch_size
-        end = min(start + batch_size, samples.shape[0])
-
-        batch_data = samples[start:end].to(device)
-        # batch_time_info = time_info[start:end].to(device)  # Not used, but ensuring consistency
-
-        output = ae.decoder(batch_data)
-
-        # Collect outputs in the correct lists
-        if 'bins' in output:
-            output_dict['bins'].append(output['bins'].cpu())
-
-        if 'cats' in output:
-            # `cats` is a list of tensors, so process each one
-            cats_list = [cat.cpu() for cat in output['cats']]
-            output_dict['cats'].append(cats_list)  # Append list directly
-
-        if 'nums' in output:
-            output_dict['nums'].append(output['nums'].cpu())
-
-        if 'times' in output:
-            output_dict['times'].append(output['times'].cpu())
-
-        if 'eos' in output:
-            output_dict['eos'].append(output['eos'].cpu())
-
-        if 'missings' in output:
-            output_dict['missings'].append(output['missings'].cpu())
-
-# Concatenating collected results
-gen_output = {}
-
-if output_dict['bins']:
-    gen_output['bins'] = torch.cat(output_dict['bins'], dim=0)
-
-if output_dict['cats']:
-    # `cats` is a list of lists of tensors, so we need to process it separately
-    num_categories = len(output_dict['cats'][0])  # Get number of categorical features
-    gen_output['cats'] = [torch.cat([batch[i] for batch in output_dict['cats']], dim=0) for i in range(num_categories)]
-
-if output_dict['nums']:
-    gen_output['nums'] = torch.cat(output_dict['nums'], dim=0)
-
-if output_dict['times']:
-    gen_output['times'] = torch.cat(output_dict['times'], dim=0)
-
-if output_dict['eos']:
-    gen_output['eos'] = torch.cat(output_dict['eos'], dim=0)
-
-if output_dict['missings']:
-    gen_output['missings'] = torch.cat(output_dict['missings'], dim=0)
-
-if not args.missing:
-    _ = gen_output.pop('missings')
+    # -------------------------------------------------------------------------
+    # 2. Load VAE Model
+    # -------------------------------------------------------------------------
+    print("\nLoad VAE model...")
+    params_path = os.path.join(base_vae_path, "vae_params.pth")
     
-del ae
-samples = samples.cpu()
-torch.cuda.empty_cache()
-gc.collect()
+    if os.path.exists(params_path):
+        model_params = torch.load(params_path, map_location=device)
+        print(f"✅ Model parameters loaded successfully from {params_path}")
+    else:
+        raise FileNotFoundError(f"❌ Parameters file not found at {params_path}")
 
-print("Transforming tensor back to tabular...")
-# data_size, seq_len, _ = latent_features.shape
-data_size, seq_len, _ = samples.shape
+    ae = tae.DeapStack(**model_params).to(device)
+    
+    print("Loading Weights...")
+    checkpoint_name = f"vae_checkpoint_epoch_{args.vae_checkpoint}.pth" if args.vae_checkpoint else "vae.pth"
+    checkpoint_path = os.path.join(base_vae_path, checkpoint_name)
 
-### Output to tensor:
-synth_data, synth_time, syn_eos = pce.convert_to_tensor(real_df, gen_output, threshold, data_size, seq_len)
-del gen_output, samples
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        ae.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Model weights loaded successfully from {checkpoint_path}")
+    else:
+        raise FileNotFoundError(f"❌ Model checkpoint not found at {checkpoint_path}")
 
-### End of sequence:
-with torch.no_grad():
-    eos_probabilities = F.softmax(syn_eos, dim=-1)[...,1]
-    eos_predictions = (eos_probabilities > 0.5).int()  # Binary EOS predictions (B, L)
-    # Compute the cumulative mask: set to 0 after the first EOS in each sequence
-    eos_cumsum = eos_predictions.cumsum(dim=1).cumsum(dim=1)  # Cumulative sum along the sequence length
-    eos_mask = (eos_cumsum <= 1).float().unsqueeze(-1)  # Mask: 1 before and at first EOS, 0 after
-    eos_mask = eos_mask.view(-1).cpu().numpy()
+    ae.eval()
 
-    ### Get unique ID
-    syn_id = torch.ones_like(syn_eos[:,:,0])
-    syn_id = syn_id.cumsum(dim=0)
-    syn_id = syn_id.view(-1).cpu().numpy()
+    # -------------------------------------------------------------------------
+    # 3. Post-process the Generated Data
+    # -------------------------------------------------------------------------
+    print("\nPost-process the generated data...")
+    batch_size = 128
+    num_batches = (samples.shape[0] + batch_size - 1) // batch_size
+    output_dict = {'bins': [], 'cats': [], 'nums': [], 'times': [], 'eos': [], 'missings': []}
 
-    ### Normalized Time
-    # _synth_time = dp.inverse_cyclical_encoding(synth_time.cpu(),1900)
-    _synth_time = np.ones_like(syn_id)
+    with torch.no_grad():
+        for i in tqdm(range(num_batches), total=num_batches):
+            start = i * batch_size
+            end = min(start + batch_size, samples.shape[0])
+            batch_data = samples[start:end].to(device)
+            output = ae.decoder(batch_data)
 
-### Tensor to tabular:
-_synth_data, _ = pce.convert_to_table(real_df, synth_data, threshold)
-_synth_data['date'] = _synth_time
-_synth_data['patient_id'] = syn_id
-_synth_data = _synth_data[eos_mask > 0]
-del real_df
-##################################################################################################################
-os.makedirs(args.save_dir, exist_ok=True)
-SAVE_PATH = os.path.join(args.save_dir,f"syn_timeautodiff_{args.model_name}")
-print(f"Saving data to {SAVE_PATH}...")
-# torch.save(synth_data,f"{SAVE_PATH}.pt")
-del synth_data
-# SAVE_PATH = os.path.join(args.save_dir,f"syn_timeautodiff_{args.model_name}_missing")
-# print(f"Saving data to {SAVE_PATH}...")
-# torch.save(syn_missing,f"{SAVE_PATH}.pt")
-# del syn_missing
-_synth_data.to_csv(f"{SAVE_PATH}.csv.gz",
-                   index=False, compression="gzip")
+            if 'bins' in output: output_dict['bins'].append(output['bins'].cpu())
+            if 'cats' in output: output_dict['cats'].append([cat.cpu() for cat in output['cats']])
+            if 'nums' in output: output_dict['nums'].append(output['nums'].cpu())
+            if 'times' in output: output_dict['times'].append(output['times'].cpu())
+            if 'eos' in output: output_dict['eos'].append(output['eos'].cpu())
+            if 'missings' in output: output_dict['missings'].append(output['missings'].cpu())
+
+    # Concatenate collected results
+    gen_output = {}
+    for key in ['bins', 'nums', 'times', 'eos', 'missings']:
+        if output_dict[key]:
+            gen_output[key] = torch.cat(output_dict[key], dim=0)
+
+    if output_dict['cats']:
+        num_categories = len(output_dict['cats'][0])
+        gen_output['cats'] = [torch.cat([batch[i] for batch in output_dict['cats']], dim=0) for i in range(num_categories)]
+
+    if not args.missing:
+        gen_output.pop('missings', None)
+        
+    del ae
+    samples = samples.cpu()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # -------------------------------------------------------------------------
+    # 4. Transform Tensor Back to Tabular
+    # -------------------------------------------------------------------------
+    print(f"\nLoading Real Data from: {args.data_path}")
+    with open(args.data_path, 'rb') as f:
+        pce_parser = pickle.load(f)
+
+    print("\nTransforming tensor back to tabular...")
+    data_size, seq_len, _ = samples.shape
+
+    synth_data, _, syn_eos = pce.convert_to_tensor(pce_parser, gen_output, data_size, seq_len)
+    synth_date = dp.inverse_cyclical_encoding(gen_output['times']) if 'times' in gen_output else np.ones((data_size, seq_len)).reshape(-1)
+    del gen_output, samples
+
+    with torch.no_grad():
+        eos_probabilities = F.softmax(syn_eos, dim=-1)[..., 1]
+        eos_predictions = (eos_probabilities > 0.5).int() 
+        
+        # Cumulative mask: set to 0 after the first EOS
+        eos_cumsum = eos_predictions.cumsum(dim=1).cumsum(dim=1)
+        eos_mask = (eos_cumsum <= 1).float().unsqueeze(-1).view(-1).cpu().numpy()
+
+        # Unique IDs and Normalized Time
+        syn_id = torch.ones_like(syn_eos[:, :, 0]).cumsum(dim=0).view(-1).cpu().numpy()
+
+    _synth_data, _ = pce.convert_to_table(pce_parser,synth_data)
+    _synth_data['date'] = synth_date
+    _synth_data['patient'] = syn_id
+    _synth_data = _synth_data[eos_mask > 0]
+    
+    del pce_parser, synth_data
+    gc.collect()
+
+    # -------------------------------------------------------------------------
+    # 5. Save Data
+    # -------------------------------------------------------------------------
+    save_path = os.path.join(args.save_dir, f"syn_{args.model_name}_{args.seed}.csv.gz")
+    print(f"\nSaving data to {save_path}...")
+    _synth_data.to_csv(save_path, index=False, compression="gzip")
+    print("✅ Done!")
+
+if __name__ == "__main__":
+    main()
