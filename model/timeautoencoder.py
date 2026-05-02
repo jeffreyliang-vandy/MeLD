@@ -183,8 +183,7 @@ class Encoder(nn.Module):
                                          nn.Linear(emb_dim, emb_dim))
         if channels > 0:
             self.encoder_Transformer = Transformer_Block(channels)
-        else: 
-            self.encoder_Transformer = None
+        else: self.encoder_Transformer = None
         
         self.encoder_mu = nn.GRU(emb_dim, hidden_size, num_layers, batch_first=True, dropout= 0.2, bidirectional = bidirectional)
         self.encoder_logvar = nn.GRU(emb_dim, hidden_size, num_layers, batch_first=True, dropout= 0.2, bidirectional = bidirectional)
