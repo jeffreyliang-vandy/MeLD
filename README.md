@@ -116,3 +116,17 @@ Thanks to the code contributions of:
 - HALO-Inpatient: https://github.com/btheodorou99/HALO_Inpatient
 
 ## Citation
+Please cite the paper if you use this code or model in your research:
+
+```
+@article {Liang2025.11.14.25340245,
+	author = {Liang, Zhuohui J. and Li, Zhuohang and Jackson, Nicholas J. and Caro-Vega, Yanink and Moreira, Ronaldo I. and Paredes, Fabio and Bernadin, Jordany and Varela, Diana and Cesar, Carina and Blasimme, Alessandro and Perkins, Jessica M. and Asiaee, Amir and Duda, Stephany N. and Malin, Bradley A. and Shepherd, Bryan E. and Yan, Chao},
+	title = {Generating Synthetic Multi-national Longitudinal Cohorts for Clinically Grounded HIV Research},
+	elocation-id = {2025.11.14.25340245},
+	year = {2025},
+	doi = {10.1101/2025.11.14.25340245},
+	URL = {https://www.medrxiv.org/content/early/2025/11/17/2025.11.14.25340245},
+	eprint = {https://www.medrxiv.org/content/early/2025/11/17/2025.11.14.25340245.full.pdf},
+	journal = {medRxiv}
+}
+```

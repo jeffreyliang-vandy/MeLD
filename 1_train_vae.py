@@ -83,17 +83,15 @@ def process_epoch(epoch, data_loader, model, optimizer, device, args, beta, is_t
     else:
         model.eval()
 
-    # Calculate beta for warmup
-    if args.warmup > 0 and epoch < args.warmup:
-        beta = min(args.max_beta, args.max_beta * epoch / args.warmup)
-
     num_batches = len(data_loader)
     batch_start_time = time.time()
     
     for batch_idx, (data, time_info, missing, masking) in enumerate(data_loader):
-        # Move data to target device
-        data, time_info = data.to(device), time_info.to(device)
-        missing, masking = missing.to(device), masking.to(device)
+        # Move data to the appropriate device
+        data = data.to(device)
+        time_info = time_info.to(device)
+        missing = missing.to(device)
+        masking = masking.to(device)
 
         # 1. Record how long we waited for the dataloader (CPU -> GPU bottleneck)
         per_batch_data_time = time.time() - batch_start_time
@@ -105,15 +103,16 @@ def process_epoch(epoch, data_loader, model, optimizer, device, args, beta, is_t
         if is_train:
             optimizer.zero_grad()
         
+        # Call model directly
         RE, KL = model.get_loss(data, time_info, missing, masking)
-        delta = torch.tensor(args.min_kl, dtype=KL.dtype, device=KL.device)
+        delta = torch.tensor(args.min_kl, dtype=KL.dtype, device=device)
         loss = RE + beta * torch.maximum(KL, delta)
 
         if is_train:
             loss.backward()
             optimizer.step()
 
-        # Get scalar metrics
+        # Extract values directly
         avg_loss = loss.item()
         avg_RE = RE.item()
         avg_KL = KL.item()
@@ -144,8 +143,9 @@ def process_epoch(epoch, data_loader, model, optimizer, device, args, beta, is_t
 # ==========================================
 
 def main():
-    # --- Set Device ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Set device manually
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     parser = argparse.ArgumentParser()
     
@@ -188,8 +188,6 @@ def main():
     logger = setup_logger(args.checkpoint_dir)
     def main_log(msg, level=logging.INFO):
         logger.log(level, msg)
-        
-    main_log(f"Using device: {device}")
 
     # --- 1. Load Data Metadata & Build Model Config ---
     params_path = os.path.join(args.checkpoint_dir, "vae_params.pth")
@@ -199,7 +197,7 @@ def main():
         with h5py.File(args.data_path, 'r') as f:
             n_bins = int(f.attrs['n_bins'])
             n_cats = int(f.attrs['n_cats'])
-            n_nums = int(f.attrs['n_nums']) - 1
+            n_nums = int(f.attrs['n_nums'])
             cards = f.attrs['cards'].tolist() 
             
             N, seq_len, feature_size = f['processed_data'].shape
@@ -232,7 +230,7 @@ def main():
         torch.save(model_config, params_path)
         main_log(f"Model parameters saved at {params_path}")
     else:
-        model_config = torch.load(params_path, map_location=device)
+        model_config = torch.load(params_path)
 
     # --- 2. Setup Modules & Dataloaders ---
     dataset = HDF5Dataset(args.data_path)
@@ -242,27 +240,28 @@ def main():
         val_size = len(dataset) - train_size
         train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-        train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size, num_workers=4, prefetch_factor=4, pin_memory=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size, num_workers=4, prefetch_factor=4, pin_memory=True, drop_last=False)
+        train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=False)
 
         main_log("Initializing Modules...")
 
         ae = tae.DeapStack(**model_config).to(device)
         optimizer_ae = Adam(ae.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        total_params = sum(p.numel() for p in ae.parameters())
+        print(f"{total_params/1e6:.1f}M parameters")
 
         # --- 3. Training Loop ---
         main_log("Starting VAE Training...")
         best_loss = float('inf')
-        max_beta = args.max_beta
-        beta = max_beta
-        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/10), ratio=0.8)
+        beta = max_beta = args.max_beta
+        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/5), ratio=0.8)
         patience = 0
 
         past_epoch, best_loss = tae.load_checkpoint(ae, optimizer_ae, args.checkpoint_dir)
         main_log(f"Best loss from checkpoint: {best_loss}")
 
-        for epoch in range(args.epochs):
-            # Train & Validate (now returning timing stats too)
+        for epoch in range(past_epoch,args.epochs):
+            # Train & Validate
             train_loss, train_re, train_kl, tr_data_time, tr_comp_time = process_epoch(epoch, train_loader, ae, optimizer_ae, device, args, beta, is_train=True)
             
             with torch.no_grad():
@@ -288,9 +287,9 @@ def main():
                 else:
                     patience += 1
                     if patience > args.patience and max_beta > args.min_beta:
-                        max_beta = max(max_beta * 0.7, args.min_beta)
+                        max_beta = max(max_beta * 0.5, args.min_beta)
                         main_log(f"Patience > {args.patience}. Reducing max_beta to: {max_beta:.6f}")
-                        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/10), ratio=0.8)
+                        beta_sched = frange_cycle_linear(n_iter=args.epochs, start=0.0, stop=max_beta, n_cycle=int(args.epochs/5), ratio=0.8)
                         patience = 0
                     if patience > args.early_stop_patience:
                         main_log(f"Patience > {args.early_stop_patience}. Triggering early stopping.")
@@ -314,21 +313,25 @@ def main():
     if args.sample:
         ae = tae.DeapStack(**model_config).to(device)
 
+    # Load weights
     ae.load_state_dict(torch.load(os.path.join(args.checkpoint_dir, "vae.pth"), map_location=device)['model_state_dict'])
     ae.eval()
 
-    sample_loader = DataLoader(IndexedDataset(dataset), batch_size=args.batch_size, shuffle=False, num_workers=8, prefetch_factor=2, pin_memory=True, drop_last=False)
+    sample_loader = DataLoader(IndexedDataset(dataset), batch_size=args.batch_size, shuffle=False, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=False)
 
     emb_list, idxs_list = [], []
 
     for data, time_info, missing, masking, idxs in sample_loader:
-        # Move data to target device
-        data, time_info = data.to(device), time_info.to(device)
-        missing, masking = missing.to(device), masking.to(device)
-        
+        # Move inputs to device manually
+        data = data.to(device)
+        time_info = time_info.to(device)
+        missing = missing.to(device)
+        masking = masking.to(device)
+
         with torch.no_grad():
             _, emb_batch, _, _ = ae(data, time_info, missing, masking)
 
+        # Move outputs back to CPU for concatenation
         emb_list.append(emb_batch.cpu())
         idxs_list.append(idxs.cpu())
 
