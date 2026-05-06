@@ -92,6 +92,10 @@ def partition_multi_seq(real_df, threshold, column_to_partition, max_len=None):
 
     assert "date" in real_df.columns, "No [date] in data"  
     real_df1 = real_df.drop('date', axis=1)
+    print(real_df1[column_to_partition].nunique())
+    partition_ids_original = real_df1[column_to_partition].values
+    unique_ids = np.unique(partition_ids_original)
+
     ## preprocessing:
     cast_cols = real_df1.nunique()[real_df1.nunique() <= 10].index.tolist()
     real_df1[cast_cols] = real_df1[cast_cols].astype('str')
@@ -105,34 +109,24 @@ def partition_multi_seq(real_df, threshold, column_to_partition, max_len=None):
     
     # Explicitly pass working_df to transform
     processed_data = torch.from_numpy(parser.transform(working_df)).unsqueeze(0)
+    assert processed_data.shape[1] == working_df.shape[0], "Row count mismatch after transformation"
     
     missing_df = real_df1.isna().astype(np.int8)
     missing_data = torch.from_numpy(parser.transform_missing(missing_df)).unsqueeze(0)
 
+    # 3. Setup Metadata
     column_index = parser._column_order.index(column_to_partition)
     datatype_info = parser.datatype_info()
     n_nums = datatype_info['n_nums']
+    num_unique = len(unique_ids)
 
-    # Extract the 1D encoded array from the tensor
-    encoded_col = processed_data[0, :, column_index].numpy()
-    unique_values = np.unique(encoded_col)
-    # ---------------------------------------------------------
-    ## Look up exact original values by row index
-    original_col_values = real_df1[column_to_partition].to_numpy()
-    original_ids = []
-    for value in tqdm(unique_values):
-        # Find the exact row index where this encoded value first appears
-        first_occurrence_idx = np.where(encoded_col == value)[0][0]
-        # Grab the untampered original value from the original dataframe
-        original_ids.append(original_col_values[first_occurrence_idx])
-    # ---------------------------------------------------------
-
-    parser.column_to_partition = np.array(original_ids).astype(int)  # Store for later use in decoding
+    # Store the unique original IDs in the parser for decoding later
+    parser.column_to_partition = unique_ids
 
     if pd.isna(max_len) or max_len is None:
-        max_len = int(processed_data.shape[1] / len(unique_values))
+        # Calculate average length if max_len isn't provided
+        max_len = int(processed_data.shape[1] / num_unique)
 
-    num_unique = len(unique_values)
     
     partitioned_tensors = torch.zeros((num_unique, max_len, processed_data.shape[2]))
     partitioned_missing = torch.zeros((num_unique, max_len, missing_data.shape[2]))
@@ -144,8 +138,12 @@ def partition_multi_seq(real_df, threshold, column_to_partition, max_len=None):
     df2 = cyclical_encode(real_df)
     time_info = torch.tensor(df2.iloc[:, -8:].values, dtype=torch.float32).unsqueeze(0)
     
-    for i, value in tqdm(enumerate(unique_values), total=num_unique, desc="Partitioning Sequences"):
-        mask = processed_data[0, :, column_index] == value
+    # 5. Partitioning Loop 
+    # We use partition_ids_original (the raw data) to ensure 100% ID accuracy
+    for i, val in tqdm(enumerate(unique_ids), total=num_unique, desc="Partitioning"):
+        # Create mask based on original row positions
+        mask = (partition_ids_original == val)
+        assert len(processed_data[0,mask,column_index].unique()) == 1, f"Multiple unique values found for partition {val} in column {column_to_partition}"
         
         selected_seq = processed_data[0, mask]
         selected_missing_seq = missing_data[0, mask]
@@ -157,7 +155,7 @@ def partition_multi_seq(real_df, threshold, column_to_partition, max_len=None):
         partitioned_missing[i, :seq_len, :] = selected_missing_seq[:seq_len]
         partitioned_tensors_ts[i, :seq_len, :] = selected_time_seq[:seq_len]
 
-        if selected_seq.shape[0] <= max_len:
+        if 0 < selected_seq.shape[0] <= max_len:
             end_of_sequence[i, seq_len - 1, 0] = 1.0  
         padding_code[i, seq_len:, 0] = 1.0
 
