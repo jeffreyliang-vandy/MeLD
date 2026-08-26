@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda env *)",
+      "Read(//Users/vumc/mambaforge/**)",
+      "Bash(/usr/bin/python3 *)"
+    ]
+  }
+}

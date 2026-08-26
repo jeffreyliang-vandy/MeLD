@@ -1,0 +1,71 @@
+# The MeLD HIV cohort run (the paper's LightningDiT-lite/1 configuration).
+#
+# Only overrides go here; everything else comes from configs/meld_default.yaml.
+#   python 1_train_vae.py           --config configs/hiv_lite1.yaml
+#   python 2_sample_latent.py       --config configs/hiv_lite1.yaml
+#   python 3_train_DiT.py           --config configs/hiv_lite1.yaml
+#   python 4_sample_synthetic_data.py --config configs/hiv_lite1.yaml
+#
+# Paths are relative to run.root, which defaults to $MELD_RUN_ROOT and falls back to
+# the directory holding this file. Set that rather than editing paths per machine.
+
+run:
+  root: null
+  name: hiv_lite1
+  seed: 0
+
+vae:
+  data:
+    h5_path: data/hiv/train.h5
+    parser_path: data/hiv/parser.pkl
+
+  arch:
+    # 32 latent channels; the DiT's in_chans is derived from this and asserted equal.
+    lat_dim: 32
+    hidden_size: 256
+    num_layers: 2
+    channels: 64
+    emb_dim: 128
+
+  loader:
+    batch_size: 128
+
+  train:
+    epochs: 5000
+    warmup: 50
+    lr: 1.0e-4
+
+  encode:
+    # Cohort table for classifier-free guidance; drop it for unconditional training.
+    condition_path: data/hiv/cohort.parquet
+
+dit:
+  runtime:
+    # Interpreter for the LightningD1T environment (torch 2.2 + transformers).
+    # e.g. /home/you/miniconda3/envs/meld_dit/bin/python
+    python: null
+    # Local CLIP checkpoint. Falls back to $MELD_CLIP_PATH.
+    clip_model_path: null
+
+  data:
+    seq_len: 120
+
+  model:
+    model_type: LightningDiT-lite/1
+
+  train:
+    max_steps: 150000
+    global_batch_size: 1024
+
+  optimizer:
+    lr: 2.0e-4
+    beta2: 0.95
+
+  sample:
+    total: 42000
+    batch_size: 1024
+    num_sampling_steps: 250
+    # Above 1.0 enables classifier-free guidance and writes conditions.csv.gz
+    # alongside the samples.
+    cfg_scale: 0.0
+    timestep_shift: 0.3

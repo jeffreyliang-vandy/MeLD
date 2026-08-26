@@ -17,79 +17,73 @@ A collection of scripts and model implementations for learning latent representa
 
 
 ## Repository layout (important files)
-- `model/timeautoencoder.py` - VAE model definitions and utilities
-- `model/LightningD1T/` — Diffusion Transformer implementation and training utilities
-- `1_train_vae.py` — Train a VAE on your dataset and save model checkpoints
-- `2_sample_latent.py` — Encode data into latent representations using a trained VAE
-- `3_train_DiT.sh` — Wrapper to train LightningDiT on latent samples (requires a config in `LightningD1T/configs/`)
-- `4_sample_synthetic_data.py` — Convert generated latent samples back into original data space
-- `evaluation/` — Metrics and evaluation scripts used in the paper
-- `baseline/` — Bundled baseline models used by the pipeline
-- `0_data_preprocess.ipynb` - Example preprocess code and Pseudo data
+- `configs/meld_default.yaml` — the configuration schema: every key, annotated, at its default
+- `configs/hiv_lite1.yaml` — the paper's run configuration
+- `model/meld_config.py` — loads/derives/validates the config used by every stage
+- `model/timeautoencoder.py` — VAE model definitions and utilities
+- `model/vae_common.py` — training/encoding logic shared by `1_train_vae.py`
+- `model/dit_adapter.py` — bridges the config to the vendored LightningDiT
+- `model/LightningD1T/` — Diffusion Transformer implementation (vendored)
+- `1_train_vae.py` — train the VAE (plain `python`, or multi-GPU via `accelerate launch`)
+- `2_sample_latent.py` — encode data into latent representations
+- `3_train_DiT.py` — train the Diffusion Transformer and sample from it
+- `4_sample_synthetic_data.py` — decode generated latents back into the original data space
+- `0_data_preprocess.ipynb` — example preprocessing; `tools/make_smoke_data.py` is a runnable
+  reference that also writes the HDF5 file the pipeline expects
+- `evaluation/` — metrics and evaluation scripts used in the paper
+- `baseline/` — bundled baseline models
 
-## Quickstart — run the main pipeline
+## Quickstart
 
 ### Prerequisites
 
-- Python 3.8+ (conda or venv recommended)
-- PyTorch compatible with your CUDA / CPU setup (see `LightningD1T/requirements.txt`)
-
-Install dependencies (example using a virtualenv):
+Two environments, one per half of the pipeline:
 
 ```bash
-# create and activate a venv
-conda create -n meld_vae -f model/environment.yaml
-conda create -n meld_dit -f model/LightningD1T/requirements.txt
+conda env create -f meld.yml                                  # VAE side (env name: ddpm)
+conda create -n meld_dit python=3.10 && \
+  pip install -r model/LightningD1T/requirements.txt          # DiT side
 ```
 
-### Pipeline (order matters)
+### Configure once, run four stages
 
-1) Train the VAE
+Every stage reads the same file and takes no other arguments. Copy
+`configs/hiv_lite1.yaml`, point it at your data, and run:
 
 ```bash
-conda run -n meld_vae \
-python 1_train_vae.py -VM your_vae_name
+python 1_train_vae.py             --config configs/my_run.yaml
+python 2_sample_latent.py         --config configs/my_run.yaml
+python 3_train_DiT.py             --config configs/my_run.yaml
+python 4_sample_synthetic_data.py --config configs/my_run.yaml
 ```
 
-2) Extract latent representations
+`configs/meld_default.yaml` documents every available key and its default; your config only
+needs the ones you change, and an unrecognised key is reported at startup.
+
+Two settings are machine-specific and can come from the environment instead of the file, so a
+config can be shared unchanged:
+
+- `run.root` — where relative paths resolve (`$MELD_RUN_ROOT`)
+- `dit.runtime.clip_model_path` — local CLIP checkpoint for text conditioning (`$MELD_CLIP_PATH`)
+
+Multi-GPU VAE training uses the same script and config:
 
 ```bash
-conda run -n meld_vae \
-python 2_sample_latent.py -VM your_vae_name
+accelerate launch 1_train_vae.py --config configs/my_run.yaml
 ```
 
-3) Train DiT on latent samples and generate latent synthetic samples
+`3_train_DiT.py` runs the DiT in its own environment as a subprocess; set `dit.runtime.python`
+to that interpreter. Use `--stage train|sample` to run one half, or `--dry-run` to inspect the
+generated LightningDiT config without launching anything.
+
+### Trying it without real data
 
 ```bash
-# Make sure you create or edit a config under `LightningD1T/configs/`
-conda run -n meld_dit bash 3_train_DiT.sh
+python tools/make_smoke_data.py --out-dir /tmp/smoke
 ```
 
-4) Decode latent samples back into original data space
-
-```bash
-conda run -n meld_vae \
-python 4_sample_synthetic_data.py \
-    -VM your_vae_name \
-    -DP path/to/dit_samples \
-    -S path/to/output/synthetic_data \
-    -M my_synthetic_dataset_name
-```
-
-## Configuration notes
-
-- `model/LightningD1T/configs/` contains example configs used for training the DiT model. Copy and adapt those for your dataset and compute budget.
-- Data preprocessing can be found in `0_data_preprocessing.py`, and model-specific data logic can be found under `HALO_Inpatient/`, `SynTEG/`, `TimeDiff` and `TimeAutoDiff/` — review those scripts when preparing your dataset.
-- We provide baseline models code from 
-    - LLM based model `HALO_Inpatient/`, 
-    - GAN based model `SynTEG/`, `
-    - diffusion based model `TimeDiff` and 
-    - latent diffusion based model `TimeAutoDiff/` 
-
-    in `baseline/`, detailed describhe of the baselines can be found in the paper.or the original paper.
-
-
-- In paper, MeLD variants are implemented with training the diffusion components of `MeLD-DDPM`, `MeLD-DiT`, `TimeDiff` and `TimeAutoDiff` on latent sample from `2_sample_latent.py`.
+writes a small synthetic HDF5 dataset, a fitted parser and a cohort table, which is enough to
+exercise all four stages on CPU.
 
 ## Evaluation
 
@@ -102,7 +96,7 @@ The `evaluation/` folder contains scripts used in the paper to compute metrics s
 evaluation can be done with
 
 ```bash
-conda run -n meld_vae \
+conda run -n ddpm \
 python evaluation/5_compute_metric_xxxx.py -R path/to/real_data -T path/to/synthetic_data -M your_synthetic_dataset_name -S path/to/save_results
 ```
 

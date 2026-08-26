@@ -1,0 +1,253 @@
+# ============================================================================
+# MeLD reference configuration -- every key, at its historical default.
+#
+# This file is the schema. `model/meld_config.py` loads it as the default layer
+# and merges your config on top, so your file only needs the keys you change.
+# A key not present here is rejected as a typo.
+#
+# `null` almost always means "derive it" -- see the comment on each one.
+# All relative paths resolve against `run.root`.
+# ============================================================================
+
+run:
+  # null -> $MELD_RUN_ROOT -> the directory containing your config file.
+  root: null
+  # One name reused for: the VAE directory suffix, the DiT experiment name, and
+  # the synthetic CSV filename. Change this per experiment.
+  name: meld
+  seed: 0
+
+# ============================== VAE =========================================
+vae:
+  # Subset of [train, encode]. `[encode]` alone reproduces the old -SP/--sample
+  # flag: skip training, just re-encode with the saved weights.
+  stages: [train, encode]
+
+  data:
+    # HDF5 with datasets processed_data/time_info/missing/masking and attrs
+    # n_bins/n_cats/n_nums/cards. Build one with tools/make_smoke_data.py.
+    h5_path: data/train.h5
+    # Pickled DataFrameParser from partition_multi_seq; step 4 needs it to invert
+    # the encoding back to a DataFrame.
+    parser_path: data/parser.pkl
+    val_fraction: 0.10
+    # null -> run.seed. Previously unseeded, so the train/val split silently
+    # changed on every resume and best_loss moved with it.
+    split_seed: null
+
+  runtime:
+    device: auto              # auto | cpu | cuda | cuda:N
+    matmul_precision: high    # high | highest | medium | null (leave torch alone)
+    num_workers: 8
+    prefetch_factor: 4
+    pin_memory: true
+    persistent_workers: false
+
+  # --- everything below maps 1:1 onto DeapStack.__init__ ---
+  # The remaining constructor arguments (seq_len, n_bins, n_cats, n_nums, cards,
+  # feature_size, time_dim) are read from the HDF5 file, and batch_size comes
+  # from vae.loader.batch_size. meld_config asserts this covers the signature
+  # exactly, so a new constructor argument cannot be added without a key here.
+  arch:
+    # -- core sizes --
+    channels: 64              # 0 disables the Transformer_Block entirely
+    hidden_size: 256
+    num_layers: 2
+    emb_dim: 128
+    lat_dim: 8                # must equal dit.model.in_chans
+    bidirectional: false
+    # -- embedding --
+    n_masks: 2
+    num_sine_terms: 16
+    num_binary_categories: 2
+    # Embeds the missing-value indicators alongside the data. Previously hardwired
+    # on, despite the decoder having a matching predict_missing switch.
+    embed_missing: true
+    nums_mlp_activation: silu     # numeric sine/cosine MLP
+    output_mlp_activation: relu   # final embedding MLP
+    # -- encoder --
+    gru_dropout: 0.2          # torch ignores this when num_layers == 1
+    logvar_min: -6.0
+    logvar_max: 2.0
+    transformer_heads: 8
+    transformer_layers: 1
+    transformer_ff_dim: 64
+    transformer_activation: gelu
+    transformer_dropout: 0.1
+    time_encode_hidden: null  # null -> emb_dim
+    time_encode_activation: relu
+    # -- decoder --
+    n_eos_classes: 2
+    nums_activation: sigmoid  # sigmoid | tanh | relu | identity | none
+    predict_times: false
+    predict_missing: true
+    eos_threshold: 0.5
+    decoder_hidden: null      # null -> hidden_size
+    decoder_activation: relu
+
+  loss:
+    # Upweights the first visit. NOTE two quirks, both preserved bit-for-bit
+    # because changing either rescales the loss of every existing run:
+    #   * values <= 1.0 disable it (it is a sentinel, not a scale)
+    #   * the applied weight is (1 + scale), so 10.0 means 11x
+    first_visit_scale: 10.0
+    time_cos_weight: 0.3      # only used when arch.predict_times is true
+    mask_missing_in_mse: true
+    bins_weight: 1.0
+    cats_weight: 1.0
+    nums_weight: 1.0
+    eos_weight: 1.0
+    missing_weight: 1.0
+    times_weight: 1.0
+    # Relative weight of the two loss aggregates. The reconstruction loss is
+    # disc_weight * (bins + cats + eos + missings) + num_weight * (nums + times),
+    # which was previously a fixed 1:1.
+    disc_weight: 1.0
+    num_weight: 1.0
+    # Denominator floor shared by every masked average in the loss.
+    loss_eps: 1.0e-8
+
+  loader:
+    batch_size: 128           # also persisted into the model config
+
+  train:
+    epochs: 5000
+    warmup: 50
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    patience: 20              # exceeded -> max_beta *= beta.decay_factor
+    early_stop_patience: 100
+    save_every: 50
+    log_every: 1
+    resume: true
+    resume_from: null         # explicit checkpoint path; null -> newest by epoch
+    load_strict: false        # historical. true catches architecture drift.
+    beta:
+      min: 1.0e-5
+      max: 1.0e-2
+      min_kl: 0.0
+      schedule_start: 0.0
+      # null -> max(1, epochs // 5). The floor matters: the old expression
+      # int(epochs/5) was 0 for any run under 5 epochs and raised ZeroDivisionError.
+      n_cycle: null
+      ratio: 0.8
+      decay_factor: 0.5
+
+  output:
+    dir: null                 # null -> <run.root>/save/vae_<run.name>
+    best_name: vae.pth
+    # Legacy 14-key file. Still written, never read by this pipeline -- it exists
+    # only for baseline/MeLD-Transformer, whose TimeLDM takes exactly those 14
+    # arguments and no **kwargs, so it must not grow.
+    params_name: vae_params.pth
+    checkpoint_template: "vae_checkpoint_epoch_{epoch}.pth"
+    # One template shared by steps 2 and 4. They previously disagreed about the
+    # suffix, so any run using an explicit checkpoint wrote a file step 4 could
+    # not find.
+    latent_template: "latent_feature{suffix}.pt"
+    condition_template: "condition_features{suffix}.parquet"
+    log_name: training.log
+    loss_table_name: vae_log.txt
+
+  encode:                     # step 2
+    h5_path: null             # null -> vae.data.h5_path (override to encode a test split)
+    checkpoint: null          # null -> the best model (vae.pth); else an epoch number
+    batch_size: 128
+    sample_size: null         # null -> encode everything
+    condition_path: null      # optional parquet cohort table, for CFG
+
+  decode:                     # step 4
+    latents_path: null        # null -> the DiT sample output
+    norm_source: null         # null -> dit.data.data_path (the latents the DiT trained on)
+    scaled: false             # true -> latents are already in the VAE's scale
+    emit_missing: false
+    batch_size: 128
+    id_column: patient
+    date_column: date
+    output_dir: null          # null -> <run.root>/save/generated
+    output_template: "syn_{name}_{seed}.csv.gz"
+
+# ============================== DiT =========================================
+# This section mirrors the vendored LightningD1T schema verbatim, except for
+# `runtime`, which model/dit_adapter.py consumes and strips before emitting.
+dit:
+  runtime:
+    # Interpreter for the DiT conda env. The DiT needs torch 2.2 + transformers
+    # while the VAE half runs in `ddpm`, so the adapter launches it as a
+    # subprocess rather than importing it. null -> sys.executable.
+    python: null
+    entry_train: train_single.py        # train_single.py | train.py | train_multigpu.py
+    entry_sample: inference_single.py
+    launcher: null                      # e.g. [accelerate, launch, --num_processes, "4"]
+    # null -> $MELD_CLIP_PATH. Upstream hardcodes an absolute path to the author's
+    # machine, which blocks any DiT run elsewhere -- CLIPTextEmbedder is built
+    # unconditionally, so this is required even at cfg_scale 0.
+    clip_model_path: null
+    materialized_config: null           # null -> <exp_dir>/_resolved_config.yaml
+
+  data:
+    data_path: null           # null -> the step-2 latent file
+    cond_path: null           # null -> the step-2 condition parquet
+    seq_len: null             # null -> seq_len persisted by the VAE
+    num_classes: 0
+    num_workers: 8
+    latent_norm: true
+
+  model:
+    # depth / hidden_size / num_heads / patch_size come from this registry key,
+    # not from YAML. See models/lightning1dit.py.
+    model_type: LightningDiT-lite/1
+    in_chans: null            # null -> vae.arch.lat_dim; asserted equal
+    patch_size: 1
+    use_qknorm: false
+    use_swiglu: true
+    use_rope: false
+    use_rmsnorm: true
+    wo_shift: false
+    use_checkpoint: false
+    learn_sigma: false
+    class_dropout_prob: 0.1   # CFG dropout on the text embedder
+
+  train:
+    max_steps: 150000
+    global_batch_size: 1024
+    output_dir: null          # null -> <run.root>/save/dit
+    exp_name: null            # null -> run.name
+    log_every: 100
+    ckpt_every: 10000
+    mixed_precision: false    # adapter re-encodes per entry point (bool vs string)
+    weight_init: null         # pruned when null: the vendored code tests presence
+    resume: false
+    grad_accum_steps: 1
+    seed: null                # null -> run.seed
+
+  optimizer:
+    lr: 2.0e-4
+    beta2: 0.95
+    max_grad_norm: null
+
+  # Splatted wholesale into create_transport(), which accepts no extra keys.
+  transport:
+    path_type: Linear         # Linear | GVP | VP
+    prediction: velocity
+    loss_weight: null
+    train_eps: null           # overwritten to 0 for Linear+velocity upstream
+    sample_eps: null
+    use_cosine_loss: true
+    use_lognorm: true
+
+  sample:
+    sampling_method: euler
+    num_sampling_steps: 250
+    atol: 1.0e-6
+    rtol: 1.0e-3
+    reverse: false
+    timestep_shift: 0.3
+    total: 42000
+    batch_size: 1024
+    cfg_scale: 0.0            # <= 1.0 takes the unconditional path
+    cond_path: null           # null -> the step-2 condition parquet
+    seed: 42
+
+  inference:
+    ckpt_step: null           # null -> newest {step:07d}.pt in the experiment

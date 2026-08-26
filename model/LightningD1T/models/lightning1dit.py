@@ -184,13 +184,19 @@ class CLIPTextEmbedder(nn.Module):
     def __init__(
         self,
         hidden_size,
-        model_name="/home/jeffrey/Documents/EA_project/save/clip-hf-model",
+        # MeLD: read from the environment so the checkpoint location is not pinned to
+        # one machine. model/dit_adapter.py sets this from dit.runtime.clip_model_path.
+        model_name=None,
         dropout_prob=0.1,
     ):
         super().__init__()
         self.dropout_prob = dropout_prob
         self.hidden_size = hidden_size
 
+        if model_name is None:
+            model_name = os.environ.get(
+                "MELD_CLIP_PATH",
+                "/home/jeffrey/Documents/EA_project/save/clip-hf-model")
         print(f"Loading CLIP model: {model_name}...")
         self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
         self.text_encoder = CLIPTextModel.from_pretrained(model_name)
