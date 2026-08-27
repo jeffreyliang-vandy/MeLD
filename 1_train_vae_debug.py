@@ -13,16 +13,24 @@ Same model, data, optimizer and beta schedule as 1_train_vae.py, plus:
         <model_path>/vae[_<vae_model>]/nan_diag/
     -- copy that directory off the server to analyse the failure offline.
 
-NO gradient clipping is added: clipping is the likely *fix* and would hide the
-divergence trajectory we are trying to record here.
+Two mitigations from NAN_DIAGNOSIS_REPORT.md are wired in as opt-in flags so the
+SAME instrumented harness can validate them:
+  * --grad_clip <max_norm>   fix 1: clip_grad_norm_ right before optimizer.step()
+                             (applied AFTER the true pre-clip grad norm is logged)
+  * --sincos_num_terms <n>   fix 2: frequency terms in compute_sine_cosine
+                             (default 16 -> top freq 2**15; use 6-8 to tame it)
+Both default to OFF/unchanged, so a bare run still reproduces the NaN.
 
 Example:
     # fast self-test: NaN poked into fc_mu.weight before optimizer.step() at
     # step 5 -> expect a clean trip at stage 'params' with SystemExit(3).
     python MeLD/1_train_vae_debug.py -DP data.h5 -MP runs/ \\
         --inject_nan_at_step 5 --max_steps 10
-    # real diagnostic run
+    # reproduce the NaN (baseline)
     python MeLD/1_train_vae_debug.py -DP data.h5 -MP runs/ --seed 0
+    # validate the fix with the same instrumentation
+    python MeLD/1_train_vae_debug.py -DP data.h5 -MP runs/ --seed 0 \\
+        --grad_clip 1.0 --sincos_num_terms 8
 """
 
 import os
@@ -123,6 +131,7 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
     delta = torch.tensor(args.min_kl, dtype=torch.float32, device=device)
     tot_loss = tot_re = tot_kl = 0.0
     nb = len(loader)
+    clip = args.grad_clip if args.grad_clip and args.grad_clip > 0 else None
 
     for data, time_info, missing, masking, idx in loader:
         data = data.to(device)
@@ -143,10 +152,16 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
         loss = RE + beta * torch.maximum(KL, delta)
         loss.backward()
 
-        diag.check_grads()
+        diag.check_grads()               # logs the TRUE pre-clip gradient norm
         diag.optimizer_state_stats()
         diag.snapshot(gstep, batch, idx)   # BEFORE the update
         diag.maybe_inject(gstep, "pre_step")
+        pre_clip_norm = None
+        if clip is not None:               # fix 1: gradient clipping
+            # clip_grad_norm_ returns the total norm BEFORE clipping
+            pre_clip_norm = float(
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            )
         optimizer.step()
         diag.check_params()
 
@@ -154,7 +169,9 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
         kl_v, _ = nd.finite_float(KL)
         loss_v, _ = nd.finite_float(loss)
         scalars = {"split": "train", "loss": loss_v, "RE": re_v, "KL": kl_v,
-                   "beta": float(beta)}
+                   "beta": float(beta), "grad_clip": clip,
+                   "pre_clip_grad_norm": pre_clip_norm,
+                   "num_terms": args.sincos_num_terms}
         diag.heartbeat(gstep, epoch, every=args.heartbeat_every)
         diag.finish_step(gstep, epoch, scalars, batch, idx)   # records or trips
 
@@ -228,6 +245,15 @@ def main():
     parser.add_argument("--emb_dim", type=int, default=128)
     parser.add_argument("--bidirectional", action="store_true", default=False)
 
+    # --- fixes from NAN_DIAGNOSIS_REPORT.md (opt-in; defaults reproduce the NaN) ---
+    parser.add_argument("--grad_clip", type=float, default=0.0,
+                        help="fix 1: clip_grad_norm_ max_norm before optimizer.step "
+                             "(0 = disabled). Try 1.0-5.0.")
+    parser.add_argument("--sincos_num_terms", type=int, default=16,
+                        help="fix 2: frequency terms in compute_sine_cosine "
+                             "(16 -> top freq 2**15, the gradient amplifier; "
+                             "use 6-8).")
+
     # --- diagnostic-only args ---
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--diag_dir", type=str, default=None)
@@ -292,6 +318,7 @@ def main():
         "hidden_size": args.hidden_size, "num_layers": args.num_layers,
         "bidirectional": args.bidirectional, "emb_dim": args.emb_dim,
         "time_dim": time_dim, "lat_dim": args.lat_dim,
+        "num_terms": args.sincos_num_terms,   # fix 2
     }
     torch.save(model_config, os.path.join(args.checkpoint_dir, "vae_params.pth"))
 
@@ -338,7 +365,10 @@ def main():
     diag.log(f"model_config={model_config}")
     diag.log(f"resume: past_epoch={past_epoch}  best_loss={best_loss}")
     diag.log(f"beta: max_beta={args.max_beta}  min_kl={args.min_kl}  "
-             f"warmup={args.warmup}  (no gradient clipping - intentional)")
+             f"warmup={args.warmup}")
+    _clip_s = f"{args.grad_clip}" if args.grad_clip and args.grad_clip > 0 else "OFF"
+    diag.log(f"fixes: grad_clip={_clip_s}  sincos_num_terms={args.sincos_num_terms} "
+             f"(defaults 0/16 reproduce the NaN)")
 
     # beta trajectory kept identical to 1_train_vae.py (incl. the patience-driven
     # max_beta halving) so the run reproduces the same optimisation path.

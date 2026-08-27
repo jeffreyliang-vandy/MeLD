@@ -60,17 +60,22 @@ class Discriminator(nn.Module):
 
 ################################################################################################################
 class Embedding_data(nn.Module):
-    def __init__(self, feature_size, emb_dim, n_bins, n_cats, n_nums, cards):
+    def __init__(self, feature_size, emb_dim, n_bins, n_cats, n_nums, cards, num_terms=16):
         super().__init__()
-        
+
         self.n_bins = n_bins
         self.n_cats = n_cats
         self.n_nums = n_nums
         self.cards = cards
-        
+        # number of frequency terms in the sine/cosine numeric encoding. The top
+        # frequency is 2**(num_terms-1); at num_terms=16 that is 2**15, whose
+        # backward Jacobian (2**15 * pi ~ 1e5) drives the gradient explosion that
+        # NaNs training. Lower it (6-8) to tame that. See NAN_DIAGNOSIS_REPORT.md.
+        self.num_terms = num_terms
+
         self.n_disc = self.n_bins + self.n_cats
         self.num_categorical_list = [2]*self.n_bins + self.cards
-        
+
         if self.n_disc > 0:
             # Create a list to store individual embeddings
             self.embeddings_list = nn.ModuleList([
@@ -78,9 +83,11 @@ class Embedding_data(nn.Module):
             ])
 
         if self.n_nums > 0:
-            self.mlp_nums = nn.Sequential(nn.Linear(32 * n_nums, 32 * n_nums),  # this should be 16 * n_nums, 16 * n_nums
+            # compute_sine_cosine returns 2 * num_terms * n_nums features
+            sincos_dim = 2 * self.num_terms * n_nums
+            self.mlp_nums = nn.Sequential(nn.Linear(sincos_dim, sincos_dim),
                                           nn.SiLU(),
-                                          nn.Linear(32 * n_nums, emb_dim))
+                                          nn.Linear(sincos_dim, emb_dim))
         
         if True:
             self.paddings_list = nn.ModuleList([
@@ -114,7 +121,7 @@ class Embedding_data(nn.Module):
 
         # Process numerical variables with sine/cosine encoding
         if self.n_nums > 0:
-            x_nums = compute_sine_cosine(x_nums, num_terms=16)
+            x_nums = compute_sine_cosine(x_nums, num_terms=self.num_terms)
             x_nums_emb = self.mlp_nums(x_nums)
             # x_emb_sum += x_nums_emb  # Add numerical embedding instead of concatenation
             x_emb_sum = torch.cat([x_emb_sum,x_nums_emb],dim=2)
@@ -175,9 +182,9 @@ class Transformer_Block(nn.Module):
 ################################################################################################################
 # @torch.compile
 class Encoder(nn.Module):
-    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim):
+    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim, num_terms=16):
         super().__init__()
-        self.Emb = Embedding_data(feature_size, emb_dim, n_bins, n_cats, n_nums, cards)
+        self.Emb = Embedding_data(feature_size, emb_dim, n_bins, n_cats, n_nums, cards, num_terms=num_terms)
         self.time_encode = nn.Sequential(nn.Linear(time_dim, emb_dim),
                                          nn.ReLU(),
                                          nn.Linear(emb_dim, emb_dim))
@@ -269,9 +276,9 @@ class Decoder(nn.Module):
 
 
 class DeapStack(nn.Module):
-    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim):
+    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim, num_terms=16):
         super().__init__()
-        self.encoder = Encoder(channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim)
+        self.encoder = Encoder(channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim, num_terms=num_terms)
         self.decoder = Decoder(channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim)
         self.n_bins = n_bins
         self.n_cats = n_cats

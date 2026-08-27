@@ -16,7 +16,13 @@ between the two paths:
 Per-rank dumps land in `<diag_dir>` for rank 0 and `<diag_dir>/rank<k>` otherwise
 (a NaN may surface on one rank only). Copy the whole tree off the server.
 
+Fixes from NAN_DIAGNOSIS_REPORT.md are opt-in flags (defaults reproduce the NaN):
+  * --grad_clip <max_norm>   fix 1: accelerator.clip_grad_norm_ before .step()
+  * --sincos_num_terms <n>   fix 2: frequency terms in compute_sine_cosine (6-8)
+
     accelerate launch MeLD/1_train_vae_aclr_debug.py -DP data.h5 -MP runs/ --seed 0
+    accelerate launch MeLD/1_train_vae_aclr_debug.py -DP data.h5 -MP runs/ --seed 0 \\
+        --grad_clip 1.0 --sincos_num_terms 8
 """
 
 import os
@@ -115,6 +121,14 @@ def main():
     parser.add_argument("--emb_dim", type=int, default=128)
     parser.add_argument("--bidirectional", action="store_true", default=False)
 
+    # --- fixes from NAN_DIAGNOSIS_REPORT.md (opt-in; defaults reproduce the NaN) ---
+    parser.add_argument("--grad_clip", type=float, default=0.0,
+                        help="fix 1: clip_grad_norm_ max_norm before .step() "
+                             "(0 = disabled). Try 1.0-5.0.")
+    parser.add_argument("--sincos_num_terms", type=int, default=16,
+                        help="fix 2: frequency terms in compute_sine_cosine "
+                             "(16 -> top freq 2**15; use 6-8).")
+
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--diag_dir", type=str, default=None)
     parser.add_argument("--buffer_steps", type=int, default=200)
@@ -173,6 +187,7 @@ def main():
         "hidden_size": args.hidden_size, "num_layers": args.num_layers,
         "bidirectional": args.bidirectional, "emb_dim": args.emb_dim,
         "time_dim": time_dim, "lat_dim": args.lat_dim,
+        "num_terms": args.sincos_num_terms,   # fix 2
     }
     if accelerator.is_main_process:
         torch.save(model_config, os.path.join(args.checkpoint_dir, "vae_params.pth"))
@@ -222,6 +237,7 @@ def main():
     diag.patch_sine_cosine(tae)
 
     grads_synced = not (accelerator.num_processes > 1 and args.use_module_bypass)
+    clip = args.grad_clip if args.grad_clip and args.grad_clip > 0 else None
     ctx = {
         "rank": rank,
         "num_processes": accelerator.num_processes,
@@ -230,12 +246,17 @@ def main():
         "dataloader_batch_size": per_gpu_batch_size,
         "grads_synced": grads_synced,
         "module_bypass": bool(args.use_module_bypass),
+        "grad_clip": clip,
+        "num_terms": args.sincos_num_terms,
     }
     diag.log("=" * 78)
     diag.log(f"RUN start (accelerate)  rank={rank}  seed={args.seed}")
     diag.log(f"context={ctx}")
     diag.log(f"model_config={model_config}")
     diag.log(f"resume: past_epoch={past_epoch}  best_loss={best_loss}")
+    diag.log(f"fixes: grad_clip={clip or 'OFF'}  "
+             f"sincos_num_terms={args.sincos_num_terms} "
+             f"(defaults 0/16 reproduce the NaN)")
 
     max_beta = args.max_beta
     beta = max_beta
@@ -271,10 +292,15 @@ def main():
                 loss = RE + beta * torch.maximum(KL, delta)
                 accelerator.backward(loss)
 
-                diag.check_grads()
+                diag.check_grads()             # logs the TRUE pre-clip grad norm
                 diag.optimizer_state_stats()
                 diag.snapshot(gstep, batch, idx)
                 diag.maybe_inject(gstep, "pre_step")
+                pre_clip_norm = None
+                if clip is not None:           # fix 1: gradient clipping
+                    pre_clip_norm = float(
+                        accelerator.clip_grad_norm_(ae.parameters(), clip)
+                    )
                 optimizer_ae.step()
                 diag.check_params()
 
@@ -285,6 +311,7 @@ def main():
                     "KL": nd.finite_float(KL)[0],
                     "beta": float(beta),
                     "actual_batch": int(data.shape[0]),
+                    "pre_clip_grad_norm": pre_clip_norm,
                     **ctx,
                 }
                 diag.heartbeat(gstep, epoch, every=args.heartbeat_every)
