@@ -212,3 +212,152 @@ instability so you are not one hyperparameter away from it returning.
 
 5. Minor: `--lr 4e-4` is high for this stack without warmup — add a short LR
    warmup, and drop `first_visit_scale` (10.0 → 2–3).
+
+---
+
+## 7. Validation runs — §6.1 and §6.2 are NOT sufficient
+
+Three instrumented runs, same seed 0, `batch_size=512`, `lr=4e-4`, `lat_dim=32`,
+`max_beta=0.01`, cyclic β schedule.
+
+| run | config | outcome | first bad stage |
+|-----|--------|---------|-----------------|
+| `diagnosis.log`  | baseline (`num_terms=16`, no clip)      | NaN @ **step 618 / epoch 11**  | `grads` |
+| `diagnosis2.log` | `--sincos_num_terms 8` (fix 2 only)     | NaN @ **step 4105 / epoch 78** | `grads` |
+| `diagnosis3.log` | `--grad_clip 1.0` (fix 1 only)          | NaN @ **step 224 / epoch 4**   | `grads` |
+
+### 7.1 Fix 2 (`num_terms 16 -> 8`) — delays, does not prevent
+
+- `sine_angle` dropped 102943 -> 402 (`2**7 * pi`); the sinusoidal amplifier is gone.
+- Survived **6.6x longer** (step 618 -> 4105).
+- But the latent kept diverging with nothing to stop it: `mu_absmax` climbed
+  0.3 -> 5 -> 10 -> 15 -> **20**, `logvar` railed at the Hardtanh `+2` ceiling for
+  **72 %** of entries the whole run (and the `-6` floor started railing too by
+  step ~4000), β cycled to **0** every ~5 epochs, `min_kl=0`. `emb_absmax`
+  reached **25**. `grad_global_norm` climbed to **1.1e17**, then `inf`.
+- This time Adam's own `exp_avg_sq` for `mlp_nums.*` / `conv_layer1.weight`
+  **also overflowed to Infinity** (it stayed finite in the baseline).
+- Top-grad param the whole run: `encoder.Emb.mlp_output.2.weight`.
+
+### 7.2 Fix 1 (`clip_grad_norm_(1.0)`) — makes it WORSE
+
+Clipping alone NaN'd **3x sooner** than the baseline and spread the damage
+across the **entire model** (baseline: only `encoder.Emb.*`, one row each;
+run 3: every embedding, both GRUs, `fc_mu`/`fc_logvar`, the whole decoder — all
+fully NaN). Two reasons, both structural:
+
+1. **The `Inf` is created inside `backward()`** (first bad stage is `grads`,
+   which is checked *before* the clip in the debug driver). `clip_grad_norm_`
+   only *rescales* an existing `.grad`; it cannot un-overflow a backward pass.
+2. **`clip_grad_norm_` with any non-finite grad poisons every parameter.** It
+   computes `total_norm` over all grads; one `Inf` makes `total_norm = inf`, so
+   `clip_coef = max_norm / (total_norm + 1e-6) -> 0`, and then every
+   `p.grad.mul_(clip_coef)` does `Inf * 0 = NaN` / `finite * 0 = 0`. The next
+   `optimizer.step()` writes NaN into the whole model. This is exactly the
+   whole-model `[params]` NaN seen in `diagnosis3.log`.
+3. `max_norm=1.0` against a raw norm of 1e5–1e9 means `clip_coef ~ 1e-5–1e-9`
+   every step. Adam's second moment `v` then tracks the *clipped* (~1.0-scale)
+   gradients instead of the real 1e5-scale ones, so `sqrt(v)` stays small and
+   `m/sqrt(v)` (the Adam step) is *larger* in the unstable direction — the run's
+   gradients were bigger earlier than the baseline's (1.7e5 vs 75 at step 150).
+
+### 7.3 What all three runs agree on
+
+- **First non-finite stage is always `grads`.** Forward and the loss
+  (`RE`, `KL`) are finite every time. The overflow is in `backward()`.
+- **`weight_global_norm` stays ~269–274** until the trip. Adam bounds the
+  *weights*; weights are never the problem.
+- **`grad_global_norm` explodes to 1e8–1e17** over tens–thousands of steps.
+- **`logvar` railed at the Hardtanh `+2` ceiling** for 56–72 % of entries from
+  step ~50, and **`mu_absmax` grows without bound** (8.5 / 20 / 6 at the three
+  trips). The KL never engages (cyclic β hits 0, `min_kl=0`).
+- The NaN originates in **`encoder.Emb`** (categorical embeddings + `mlp_nums`),
+  and the largest gradient before the blow-up is
+  **`encoder.Emb.mlp_output.2.weight`**.
+
+**Conclusion:** this is not one bad component — it is a systemically unstable
+configuration (unregularised latent + high-freq Fourier features + post-LN
+transformer + `lr=4e-4`, no warmup). A rescaling clip applied *after* an
+`Inf`-producing backward cannot help and actively hurts.
+
+---
+
+## 8. Revised solution plan
+
+### 8.1 Must-have: skip non-finite steps (replace the naive clip)
+
+Rescaling can't survive an `Inf`; **skipping** can. This is the `GradScaler`
+pattern. In both training scripts, after `backward()`:
+
+```python
+grads = [p.grad for p in ae.parameters() if p.grad is not None]
+finite = all(torch.isfinite(g).all() for g in grads)
+if not finite:
+    optimizer_ae.zero_grad(set_to_none=True)   # drop this batch entirely
+    n_skipped += 1
+    continue
+total_norm = torch.nn.utils.clip_grad_norm_(ae.parameters(), max_norm=10.0)
+optimizer_ae.step()
+```
+
+Notes:
+- `max_norm` **10–100**, not 1.0 — enough to stop fp32 overflow, loose enough
+  not to fight Adam (see §7.2.3). Or clip-by-value with
+  `torch.nan_to_num_(g, nan=0, posinf=1e4, neginf=-1e4)` per grad first.
+- Log `n_skipped`. If more than a few per epoch, §8.2/§8.3 are not done.
+- This is a guard, not a cure. It keeps a run alive so the real fixes can work.
+
+### 8.2 Must-have: make the latent actually regularised
+
+The latent diverges in every run. Fix all three of:
+
+- **`fc_logvar`** — *IMPLEMENTED* (`model/timeautoencoder.py`, `Encoder`): the
+  dead `Hardtanh(-6, 2)` is replaced by a plain `nn.Linear` +
+  `logvar = logvar_min + (logvar_max - logvar_min) * sigmoid(raw)` in `forward`
+  (same `(-6, 2)` range by default, gradient never zero). Toggle the range with
+  `--logvar_min` / `--logvar_max`.
+- **`mu`** — *IMPLEMENTED*: `mu = mu_clip * tanh(mu / mu_clip)` (`--mu_clip 5.0`
+  default, `<=0` disables). ~identity for healthy O(1) `mu`, hard ceiling at
+  `mu_clip`. NOTE: like any squash its gradient decays far out — if `mu` still
+  creeps up, switch to / add the `1e-4 * mu.pow(2).mean()` loss penalty.
+- **KL must never be zero-weighted** — *NOT YET DONE*: replace `frange_cycle_linear`
+  with a
+  *monotone* warmup to a floor that stays put, e.g. `beta = min(max_beta,
+  max_beta * step / warmup_steps)` with `max_beta >= 1e-3`; and use free-bits:
+  ```python
+  kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())   # (B,L,lat)
+  loss_kld = torch.clamp(kl_per_dim, min=free_bits).sum(-1).mean()   # free_bits ~ 0.5
+  ```
+  Delete the `torch.maximum(KL, delta)` / `min_kl` no-op.
+
+### 8.3 Should-have: remove the remaining amplifiers
+
+- **Fourier features** — *PARTLY IMPLEMENTED*: `nn.LayerNorm(emb_dim)` is applied
+  to the `mlp_nums` output before the `torch.cat` into `x_emb_sum`
+  (`Embedding_data`, `--fourier_layernorm` / `--no-fourier_layernorm`, on by
+  default). Combine with `--sincos_num_terms 6-8`. Dropping the sine/cosine
+  encoding entirely (plain `Linear -> SiLU -> Linear` on the raw numerics) is
+  still the more aggressive option if this is not enough.
+- **Post-LN transformer** (`get_torch_trans`, `:141`): `norm_first=True`. NOT DONE.
+- **LR**: warmup 0 -> `lr` over ~500 steps, and try `lr=1e-4`. Every run is
+  unstable by step ~100, i.e. from the start of real training.
+- **`first_visit_scale`** (`auto_loss`, `:328`): 10.0 -> 2–3.
+
+### 8.4 Recommended order
+
+1. **§8.1 + §8.2** together, re-run `1_train_vae_debug.py --seed 0`. Target:
+   0 skipped steps, `mu_absmax < 4`, `grad_global_norm < 1e3` steady-state.
+2. If still skipping steps or `mu` still growing: add **§8.3** (transformer +
+   LR warmup + Fourier LayerNorm).
+3. Only once a debug run survives >200 epochs clean, port the same changes to
+   `1_train_vae.py` / `1_train_vae_aclr.py`.
+
+### 8.5 Debug-harness follow-ups
+
+- Change `--grad_clip` in the `*_debug.py` drivers to the **skip-then-clip**
+  guard of §8.1 (current behaviour rescales and is proven harmful), and add
+  `--free_bits`, `--beta_warmup_steps`, `--logvar_bound {hardtanh,sigmoid}`,
+  `--lr_warmup_steps` so §8.2/§8.3 can be swept from the CLI.
+- Pull `metrics_tail.jsonl` / `batch.pt` from `diagnosis3.log`'s run: confirm
+  the step-224 batch's raw `backward` grad is `Inf` (stage `grads`) *before*
+  any clip, i.e. the overflow is independent of clipping.

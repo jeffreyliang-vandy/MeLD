@@ -37,6 +37,7 @@ import os
 import argparse
 import logging
 import time
+from argparse import BooleanOptionalAction
 
 import numpy as np
 import h5py
@@ -253,6 +254,18 @@ def main():
                         help="fix 2: frequency terms in compute_sine_cosine "
                              "(16 -> top freq 2**15, the gradient amplifier; "
                              "use 6-8).")
+    # --- latent / Fourier bounds (§8.2 / §8.3); ENABLED by default here ---
+    parser.add_argument("--fourier_layernorm", action=BooleanOptionalAction,
+                        default=True,
+                        help="LayerNorm the mlp_nums (Fourier) embedding before "
+                             "it joins x_emb_sum.")
+    parser.add_argument("--logvar_min", type=float, default=-6.0)
+    parser.add_argument("--logvar_max", type=float, default=2.0,
+                        help="fc_logvar squashed to (logvar_min, logvar_max) via "
+                             "a smooth sigmoid (replaces the dead Hardtanh).")
+    parser.add_argument("--mu_clip", type=float, default=5.0,
+                        help="soft bound mu := mu_clip*tanh(mu/mu_clip); "
+                             "<=0 disables.")
 
     # --- diagnostic-only args ---
     parser.add_argument("--seed", type=int, default=0)
@@ -318,7 +331,11 @@ def main():
         "hidden_size": args.hidden_size, "num_layers": args.num_layers,
         "bidirectional": args.bidirectional, "emb_dim": args.emb_dim,
         "time_dim": time_dim, "lat_dim": args.lat_dim,
-        "num_terms": args.sincos_num_terms,   # fix 2
+        "num_terms": args.sincos_num_terms,          # fix 2
+        "fourier_layernorm": args.fourier_layernorm,  # §8.3
+        "logvar_min": args.logvar_min,                # §8.2
+        "logvar_max": args.logvar_max,                # §8.2
+        "mu_clip": args.mu_clip,                      # §8.2
     }
     torch.save(model_config, os.path.join(args.checkpoint_dir, "vae_params.pth"))
 
@@ -367,8 +384,10 @@ def main():
     diag.log(f"beta: max_beta={args.max_beta}  min_kl={args.min_kl}  "
              f"warmup={args.warmup}")
     _clip_s = f"{args.grad_clip}" if args.grad_clip and args.grad_clip > 0 else "OFF"
-    diag.log(f"fixes: grad_clip={_clip_s}  sincos_num_terms={args.sincos_num_terms} "
-             f"(defaults 0/16 reproduce the NaN)")
+    diag.log(f"fixes: grad_clip={_clip_s}  sincos_num_terms={args.sincos_num_terms}")
+    diag.log(f"latent bounds: mu_clip={args.mu_clip}  "
+             f"logvar in ({args.logvar_min},{args.logvar_max}) via sigmoid  "
+             f"fourier_layernorm={args.fourier_layernorm}")
 
     # beta trajectory kept identical to 1_train_vae.py (incl. the patience-driven
     # max_beta halving) so the run reproduces the same optimisation path.

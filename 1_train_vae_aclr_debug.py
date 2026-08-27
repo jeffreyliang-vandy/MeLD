@@ -128,6 +128,15 @@ def main():
     parser.add_argument("--sincos_num_terms", type=int, default=16,
                         help="fix 2: frequency terms in compute_sine_cosine "
                              "(16 -> top freq 2**15; use 6-8).")
+    parser.add_argument("--fourier_layernorm", action=BooleanOptionalAction,
+                        default=True,
+                        help="LayerNorm the mlp_nums (Fourier) embedding.")
+    parser.add_argument("--logvar_min", type=float, default=-6.0)
+    parser.add_argument("--logvar_max", type=float, default=2.0,
+                        help="fc_logvar squashed to (logvar_min, logvar_max) "
+                             "via sigmoid (replaces the dead Hardtanh).")
+    parser.add_argument("--mu_clip", type=float, default=5.0,
+                        help="soft bound mu := mu_clip*tanh(mu/mu_clip); <=0 off.")
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--diag_dir", type=str, default=None)
@@ -187,7 +196,11 @@ def main():
         "hidden_size": args.hidden_size, "num_layers": args.num_layers,
         "bidirectional": args.bidirectional, "emb_dim": args.emb_dim,
         "time_dim": time_dim, "lat_dim": args.lat_dim,
-        "num_terms": args.sincos_num_terms,   # fix 2
+        "num_terms": args.sincos_num_terms,          # fix 2
+        "fourier_layernorm": args.fourier_layernorm,  # §8.3
+        "logvar_min": args.logvar_min,                # §8.2
+        "logvar_max": args.logvar_max,                # §8.2
+        "mu_clip": args.mu_clip,                      # §8.2
     }
     if accelerator.is_main_process:
         torch.save(model_config, os.path.join(args.checkpoint_dir, "vae_params.pth"))
@@ -255,8 +268,10 @@ def main():
     diag.log(f"model_config={model_config}")
     diag.log(f"resume: past_epoch={past_epoch}  best_loss={best_loss}")
     diag.log(f"fixes: grad_clip={clip or 'OFF'}  "
-             f"sincos_num_terms={args.sincos_num_terms} "
-             f"(defaults 0/16 reproduce the NaN)")
+             f"sincos_num_terms={args.sincos_num_terms}")
+    diag.log(f"latent bounds: mu_clip={args.mu_clip}  "
+             f"logvar in ({args.logvar_min},{args.logvar_max}) via sigmoid  "
+             f"fourier_layernorm={args.fourier_layernorm}")
 
     max_beta = args.max_beta
     beta = max_beta

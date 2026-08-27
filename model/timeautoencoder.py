@@ -60,7 +60,8 @@ class Discriminator(nn.Module):
 
 ################################################################################################################
 class Embedding_data(nn.Module):
-    def __init__(self, feature_size, emb_dim, n_bins, n_cats, n_nums, cards, num_terms=16):
+    def __init__(self, feature_size, emb_dim, n_bins, n_cats, n_nums, cards,
+                 num_terms=16, fourier_layernorm=True):
         super().__init__()
 
         self.n_bins = n_bins
@@ -88,6 +89,14 @@ class Embedding_data(nn.Module):
             self.mlp_nums = nn.Sequential(nn.Linear(sincos_dim, sincos_dim),
                                           nn.SiLU(),
                                           nn.Linear(sincos_dim, emb_dim))
+            # LayerNorm the Fourier-feature embedding before it is concatenated
+            # into x_emb_sum: the high-frequency sine/cosine terms make this
+            # branch's backward gradient the dominant fp32-overflow driver (see
+            # NAN_DIAGNOSIS_REPORT.md). Normalising bounds the activation scale
+            # and, with it, the gradient magnitude flowing back into mlp_nums.
+            self.nums_ln = nn.LayerNorm(emb_dim) if fourier_layernorm else None
+        else:
+            self.nums_ln = None
         
         if True:
             self.paddings_list = nn.ModuleList([
@@ -123,6 +132,8 @@ class Embedding_data(nn.Module):
         if self.n_nums > 0:
             x_nums = compute_sine_cosine(x_nums, num_terms=self.num_terms)
             x_nums_emb = self.mlp_nums(x_nums)
+            if self.nums_ln is not None:
+                x_nums_emb = self.nums_ln(x_nums_emb)
             # x_emb_sum += x_nums_emb  # Add numerical embedding instead of concatenation
             x_emb_sum = torch.cat([x_emb_sum,x_nums_emb],dim=2)
         #   print(f"x_emb_sum.shape:{x_emb_sum.shape}")
@@ -182,43 +193,63 @@ class Transformer_Block(nn.Module):
 ################################################################################################################
 # @torch.compile
 class Encoder(nn.Module):
-    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim, num_terms=16):
+    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim,
+                 num_terms=16, fourier_layernorm=True,
+                 logvar_min=-6.0, logvar_max=2.0, mu_clip=5.0):
         super().__init__()
-        self.Emb = Embedding_data(feature_size, emb_dim, n_bins, n_cats, n_nums, cards, num_terms=num_terms)
+        self.Emb = Embedding_data(feature_size, emb_dim, n_bins, n_cats, n_nums, cards,
+                                  num_terms=num_terms, fourier_layernorm=fourier_layernorm)
         self.time_encode = nn.Sequential(nn.Linear(time_dim, emb_dim),
                                          nn.ReLU(),
                                          nn.Linear(emb_dim, emb_dim))
         if channels > 0:
             self.encoder_Transformer = Transformer_Block(channels)
         else: self.encoder_Transformer = None
-        
+
         self.encoder_mu = nn.GRU(emb_dim, hidden_size, num_layers, batch_first=True, dropout= 0.2, bidirectional = bidirectional)
         self.encoder_logvar = nn.GRU(emb_dim, hidden_size, num_layers, batch_first=True, dropout= 0.2, bidirectional = bidirectional)
-        
-        if bidirectional:
-            self.fc_mu = nn.Linear(2*hidden_size, lat_dim)
-            self.fc_logvar = NonLinear(2*hidden_size, lat_dim, activation=nn.Hardtanh(min_val=-6.,max_val=2.))
-        else:
-            self.fc_mu = nn.Linear(hidden_size, lat_dim)
-            self.fc_logvar = NonLinear(hidden_size, lat_dim, activation=nn.Hardtanh(min_val=-6.,max_val=2.))
+
+        gru_out = 2*hidden_size if bidirectional else hidden_size
+        self.fc_mu = nn.Linear(gru_out, lat_dim)
+        # was: NonLinear(gru_out, lat_dim, Hardtanh(-6, 2)) -- Hardtanh saturates
+        # with ZERO gradient, so >50% of logvar entries railed at +2 permanently
+        # (dead variance head). Plain Linear + a smooth sigmoid squash in forward
+        # keeps the same (logvar_min, logvar_max) range but always has a gradient.
+        self.fc_logvar = nn.Linear(gru_out, lat_dim)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
+        # soft bound on mu: mu_clip * tanh(x / mu_clip) -- ~identity near 0,
+        # asymptotes to +-mu_clip. <=0 disables. Stops mu marching to 20 (which
+        # it did in every un-bounded run) while leaving healthy O(1) mu untouched.
+        self.mu_clip = float(mu_clip)
 
     def reparametrize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-    
+
+    def _bound_mu(self, mu):
+        if self.mu_clip and self.mu_clip > 0:
+            return self.mu_clip * torch.tanh(mu / self.mu_clip)
+        return mu
+
+    def _bound_logvar(self, raw):
+        # smooth squash into (logvar_min, logvar_max), gradient never zero
+        return self.logvar_min + (self.logvar_max - self.logvar_min) * torch.sigmoid(raw)
+
     def forward(self, x, time_info,missing, masking):
         x = self.Emb(x, missing, masking)
         if self.encoder_Transformer is not None:
             x = self.encoder_Transformer(x)
         x = x + self.time_encode(time_info)
-        
+
         mu_z, _ = self.encoder_mu(x)
         logvar_z, _ = self.encoder_logvar(x)
-        
-        mu_z = self.fc_mu(mu_z); logvar_z = self.fc_logvar(logvar_z)
+
+        mu_z = self._bound_mu(self.fc_mu(mu_z))
+        logvar_z = self._bound_logvar(self.fc_logvar(logvar_z))
         emb = self.reparametrize(mu_z, logvar_z)
-        
+
         return emb, mu_z, logvar_z
     
 class Decoder(nn.Module):
@@ -276,9 +307,13 @@ class Decoder(nn.Module):
 
 
 class DeapStack(nn.Module):
-    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim, num_terms=16):
+    def __init__(self, channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim,
+                 num_terms=16, fourier_layernorm=True,
+                 logvar_min=-6.0, logvar_max=2.0, mu_clip=5.0):
         super().__init__()
-        self.encoder = Encoder(channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim, num_terms=num_terms)
+        self.encoder = Encoder(channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim,
+                               num_terms=num_terms, fourier_layernorm=fourier_layernorm,
+                               logvar_min=logvar_min, logvar_max=logvar_max, mu_clip=mu_clip)
         self.decoder = Decoder(channels, batch_size, seq_len, n_bins, n_cats, n_nums, cards, feature_size, hidden_size, num_layers, bidirectional, emb_dim, time_dim, lat_dim)
         self.n_bins = n_bins
         self.n_cats = n_cats
