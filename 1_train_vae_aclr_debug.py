@@ -29,6 +29,7 @@ import os
 import argparse
 import logging
 import time
+import math
 from argparse import BooleanOptionalAction
 
 import numpy as np
@@ -126,8 +127,20 @@ def main():
                         help="fix 1: clip_grad_norm_ max_norm before .step() "
                              "(0 = disabled). Try 1.0-5.0.")
     parser.add_argument("--sincos_num_terms", type=int, default=16,
-                        help="fix 2: frequency terms in compute_sine_cosine "
+                        help="frequency terms in compute_sine_cosine "
                              "(16 -> top freq 2**15; use 6-8).")
+    parser.add_argument("--skip_nonfinite_steps", action=BooleanOptionalAction,
+                        default=False,
+                        help="fix 2 (NAN_DIAGNOSIS_REPORT §8.1): zero the grads "
+                             "and skip optimizer.step() when the pre-clip "
+                             "gradient is non-finite. Under fp16 mixed precision "
+                             "accelerate's GradScaler already does this; the "
+                             "guard also covers bf16/fp32 accelerate runs and "
+                             "keeps parity with 1_train_vae_debug.py.")
+    parser.add_argument("--skip_grad_norm_over", type=float, default=0.0,
+                        help="fix 2 extension: also skip when a finite global "
+                             "grad norm exceeds this (0 = only skip non-finite). "
+                             "Note: under fp16 this sees the *scaled* grad norm.")
     parser.add_argument("--fourier_layernorm", action=BooleanOptionalAction,
                         default=True,
                         help="LayerNorm the mlp_nums (Fourier) embedding.")
@@ -268,7 +281,9 @@ def main():
     diag.log(f"model_config={model_config}")
     diag.log(f"resume: past_epoch={past_epoch}  best_loss={best_loss}")
     diag.log(f"fixes: grad_clip={clip or 'OFF'}  "
-             f"sincos_num_terms={args.sincos_num_terms}")
+             f"sincos_num_terms={args.sincos_num_terms}  "
+             f"skip_nonfinite_steps={args.skip_nonfinite_steps}"
+             f"{f'  skip_grad_norm_over={args.skip_grad_norm_over:g}' if args.skip_grad_norm_over > 0 else ''}")
     diag.log(f"latent bounds: mu_clip={args.mu_clip}  "
              f"logvar in ({args.logvar_min},{args.logvar_max}) via sigmoid  "
              f"fourier_layernorm={args.fourier_layernorm}")
@@ -282,6 +297,7 @@ def main():
     delta = torch.tensor(args.min_kl, dtype=torch.float32, device=accelerator.device)
     patience = 0
     gstep = 0
+    n_skipped = 0
 
     def get_loss(*a):
         # original 1_train_vae_aclr.py calls model.module.get_loss(...), which
@@ -307,16 +323,32 @@ def main():
                 loss = RE + beta * torch.maximum(KL, delta)
                 accelerator.backward(loss)
 
-                diag.check_grads()             # logs the TRUE pre-clip grad norm
+                grad_norm = diag.check_grads()   # TRUE pre-clip global grad norm
                 diag.optimizer_state_stats()
                 diag.snapshot(gstep, batch, idx)
                 diag.maybe_inject(gstep, "pre_step")
+
+                # fix 2: drop non-finite (or optionally huge) gradient steps.
+                bad_grad = (grad_norm is None or not math.isfinite(grad_norm)
+                            or not diag.last_grads_finite())
+                if (not bad_grad and args.skip_grad_norm_over > 0
+                        and grad_norm > args.skip_grad_norm_over):
+                    bad_grad = True
+                step_skipped = bool(args.skip_nonfinite_steps and bad_grad)
+
                 pre_clip_norm = None
-                if clip is not None:           # fix 1: gradient clipping
-                    pre_clip_norm = float(
-                        accelerator.clip_grad_norm_(ae.parameters(), clip)
-                    )
-                optimizer_ae.step()
+                if step_skipped:
+                    optimizer_ae.zero_grad(set_to_none=True)
+                    n_skipped += 1
+                    diag.log(f"SKIP step={gstep} ep={epoch} "
+                             f"grad_norm={grad_norm} (cum_skipped={n_skipped})",
+                             echo=False)
+                else:
+                    if clip is not None:           # fix 1: gradient clipping
+                        pre_clip_norm = float(
+                            accelerator.clip_grad_norm_(ae.parameters(), clip)
+                        )
+                    optimizer_ae.step()
                 diag.check_params()
 
                 scalars = {
@@ -327,6 +359,8 @@ def main():
                     "beta": float(beta),
                     "actual_batch": int(data.shape[0]),
                     "pre_clip_grad_norm": pre_clip_norm,
+                    "step_skipped": step_skipped,
+                    "n_skipped": n_skipped,
                     **ctx,
                 }
                 diag.heartbeat(gstep, epoch, every=args.heartbeat_every)
@@ -337,6 +371,11 @@ def main():
                     diag.log(f"reached --max_steps={args.max_steps}; stopping.")
                     diag.restore()
                     return
+
+            if n_skipped:
+                diag.log(f"epoch {epoch}: {n_skipped} steps skipped so far "
+                         f"(non-finite grad"
+                         f"{f' or norm > {args.skip_grad_norm_over:g}' if args.skip_grad_norm_over > 0 else ''})")
 
             # finiteness-only validation (also tracks mean val RE for the schedule)
             ae.eval()

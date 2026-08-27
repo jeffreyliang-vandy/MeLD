@@ -37,6 +37,7 @@ import os
 import argparse
 import logging
 import time
+import math
 from argparse import BooleanOptionalAction
 
 import numpy as np
@@ -133,6 +134,7 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
     tot_loss = tot_re = tot_kl = 0.0
     nb = len(loader)
     clip = args.grad_clip if args.grad_clip and args.grad_clip > 0 else None
+    n_skipped = 0
 
     for data, time_info, missing, masking, idx in loader:
         data = data.to(device)
@@ -153,17 +155,34 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
         loss = RE + beta * torch.maximum(KL, delta)
         loss.backward()
 
-        diag.check_grads()               # logs the TRUE pre-clip gradient norm
+        grad_norm = diag.check_grads()   # TRUE pre-clip global gradient norm
         diag.optimizer_state_stats()
         diag.snapshot(gstep, batch, idx)   # BEFORE the update
         diag.maybe_inject(gstep, "pre_step")
+
+        # fix 2: drop the step instead of feeding a garbage sign(g) update to
+        # Adam (which bounds the weight *update*, not the raw gradient, so an
+        # exploded gradient silently becomes a random-walk step).
+        bad_grad = (grad_norm is None or not math.isfinite(grad_norm)
+                    or not diag.last_grads_finite())
+        if (not bad_grad and args.skip_grad_norm_over > 0
+                and grad_norm > args.skip_grad_norm_over):
+            bad_grad = True
+        step_skipped = bool(args.skip_nonfinite_steps and bad_grad)
+
         pre_clip_norm = None
-        if clip is not None:               # fix 1: gradient clipping
-            # clip_grad_norm_ returns the total norm BEFORE clipping
-            pre_clip_norm = float(
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            )
-        optimizer.step()
+        if step_skipped:
+            optimizer.zero_grad(set_to_none=True)
+            n_skipped += 1
+            diag.log(f"SKIP step={gstep} ep={epoch} grad_norm={grad_norm} "
+                     f"(cum_skipped={n_skipped})", echo=False)
+        else:
+            if clip is not None:               # fix 1: gradient clipping
+                # clip_grad_norm_ returns the total norm BEFORE clipping
+                pre_clip_norm = float(
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                )
+            optimizer.step()
         diag.check_params()
 
         re_v, _ = nd.finite_float(RE)
@@ -172,6 +191,7 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
         scalars = {"split": "train", "loss": loss_v, "RE": re_v, "KL": kl_v,
                    "beta": float(beta), "grad_clip": clip,
                    "pre_clip_grad_norm": pre_clip_norm,
+                   "step_skipped": step_skipped, "n_skipped": n_skipped,
                    "num_terms": args.sincos_num_terms}
         diag.heartbeat(gstep, epoch, every=args.heartbeat_every)
         diag.finish_step(gstep, epoch, scalars, batch, idx)   # records or trips
@@ -184,6 +204,10 @@ def train_epoch(epoch, loader, model, optimizer, device, args, beta, diag, gstep
             diag.log(f"reached --max_steps={args.max_steps}; stopping.")
             return tot_loss / nb, tot_re / nb, tot_kl / nb, gstep, True
 
+    if n_skipped:
+        diag.log(f"epoch {epoch}: skipped {n_skipped}/{nb} steps "
+                 f"(non-finite grad"
+                 f"{f' or norm > {args.skip_grad_norm_over:g}' if args.skip_grad_norm_over > 0 else ''})")
     return tot_loss / nb, tot_re / nb, tot_kl / nb, gstep, False
 
 
@@ -251,9 +275,23 @@ def main():
                         help="fix 1: clip_grad_norm_ max_norm before optimizer.step "
                              "(0 = disabled). Try 1.0-5.0.")
     parser.add_argument("--sincos_num_terms", type=int, default=16,
-                        help="fix 2: frequency terms in compute_sine_cosine "
+                        help="frequency terms in compute_sine_cosine "
                              "(16 -> top freq 2**15, the gradient amplifier; "
                              "use 6-8).")
+    parser.add_argument("--skip_nonfinite_steps", action=BooleanOptionalAction,
+                        default=False,
+                        help="fix 2 (NAN_DIAGNOSIS_REPORT §8.1): when the pre-clip "
+                             "gradient is non-finite (Inf/NaN element, or a "
+                             "per-parameter norm that overflowed float range), "
+                             "zero the grads and skip optimizer.step() for that "
+                             "batch. This is what accelerate's fp16 GradScaler "
+                             "does implicitly and is why the accelerate run "
+                             "converges where plain fp32 stalls. Enable for real "
+                             "runs.")
+    parser.add_argument("--skip_grad_norm_over", type=float, default=0.0,
+                        help="fix 2 extension: also skip the step when a *finite* "
+                             "global grad norm exceeds this (0 = only skip "
+                             "non-finite). Try 1e3-1e4.")
     # --- latent / Fourier bounds (§8.2 / §8.3); ENABLED by default here ---
     parser.add_argument("--fourier_layernorm", action=BooleanOptionalAction,
                         default=True,
@@ -384,7 +422,9 @@ def main():
     diag.log(f"beta: max_beta={args.max_beta}  min_kl={args.min_kl}  "
              f"warmup={args.warmup}")
     _clip_s = f"{args.grad_clip}" if args.grad_clip and args.grad_clip > 0 else "OFF"
-    diag.log(f"fixes: grad_clip={_clip_s}  sincos_num_terms={args.sincos_num_terms}")
+    diag.log(f"fixes: grad_clip={_clip_s}  sincos_num_terms={args.sincos_num_terms}  "
+             f"skip_nonfinite_steps={args.skip_nonfinite_steps}"
+             f"{f'  skip_grad_norm_over={args.skip_grad_norm_over:g}' if args.skip_grad_norm_over > 0 else ''}")
     diag.log(f"latent bounds: mu_clip={args.mu_clip}  "
              f"logvar in ({args.logvar_min},{args.logvar_max}) via sigmoid  "
              f"fourier_layernorm={args.fourier_layernorm}")

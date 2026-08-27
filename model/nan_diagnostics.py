@@ -452,6 +452,21 @@ class NaNDiagnostics:
             }
         return self._grad_global_norm
 
+    def last_grads_finite(self):
+        """True iff the most recent check_grads() saw only finite gradients.
+
+        Covers both routes to a bad step: non-finite grad *elements* (n_bad, which
+        also forces _grad_global_norm to inf) and a per-parameter L2 norm that
+        overflowed float range while every element stayed finite (that parameter
+        sorts to the top of _grad_topk, so scanning it is enough)."""
+        if self._findings.get("grads"):
+            return False
+        for r in (self._grad_topk or []):
+            gn = r.get("grad_norm", 0.0)
+            if r.get("n_bad", 0) or gn is None or not math.isfinite(gn):
+                return False
+        return True
+
     def check_params(self):
         bad = []
         total_sq = 0.0
