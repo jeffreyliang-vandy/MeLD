@@ -26,6 +26,10 @@ def main():
     cfg = meld_config.load(args.config)
     stages = ["train", "sample"] if args.stage == "both" else [args.stage]
 
+    if not args.dry_run:
+        # Next to the checkpoints, so the run can be reproduced from its own directory.
+        print(f"[3_train_DiT] config copy: {cfg.snapshot_config(cfg.dit_exp_dir())}")
+
     for stage in stages:
         print(f"\n=== DiT: {stage} ===")
         dit_adapter.run(cfg, stage, dry_run=args.dry_run)

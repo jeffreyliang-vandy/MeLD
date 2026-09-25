@@ -50,6 +50,8 @@ def main():
 
     log(f"Config: {cfg.config_path}")
     log(f"Output: {cfg.vae.output.dir}")
+    if is_main:
+        log(f"Config copy: {cfg.snapshot_config(out_dir)}")
     torch.manual_seed(int(cfg.run.seed))
     log(f"Device: {device} | processes: {accelerator.num_processes}")
 

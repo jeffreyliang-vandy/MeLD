@@ -17,9 +17,12 @@ Two design points worth knowing:
   "every parameter is exposed" true over time rather than just today.
 """
 import difflib
+import filecmp
 import inspect
 import os
+import shutil
 import sys
+import time
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -202,6 +205,29 @@ class MeldConfig:
 
     def params_path(self):
         return os.path.join(str(self.vae.output.dir), str(self.vae.output.params_name))
+
+    def snapshot_config(self, dest_dir):
+        """Copy the config file this run was launched with into `dest_dir`.
+
+        Verbatim rather than the resolved config, so it is still a file you can hand back
+        to `--config`. Run directories get reused (resume, re-encode), so a *different*
+        file of the same name already there is kept and this copy gets a timestamp suffix;
+        an identical one is left alone. Returns the path of the copy.
+
+        Note `run.root: null` resolves to the directory holding the config, so set
+        `run.root` (or $MELD_RUN_ROOT) explicitly if you re-run the copy from its new
+        location; otherwise relative paths would resolve against the destination.
+        """
+        os.makedirs(dest_dir, exist_ok=True)
+        name = os.path.basename(self.config_path)
+        dest = os.path.join(dest_dir, name)
+        if os.path.exists(dest):
+            if filecmp.cmp(self.config_path, dest, shallow=False):
+                return dest
+            root, ext = os.path.splitext(name)
+            dest = os.path.join(dest_dir, f"{root}.{time.strftime('%Y%m%d-%H%M%S')}{ext}")
+        shutil.copy2(self.config_path, dest)
+        return dest
 
     def dit_exp_dir(self):
         return os.path.join(str(self.dit.train.output_dir), str(self.dit.train.exp_name))
