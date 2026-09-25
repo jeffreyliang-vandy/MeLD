@@ -50,6 +50,7 @@ from tqdm import tqdm
 from datasets.condition2text import generate_text_conditions
 from datasets.real_dataset import ConditionDataset
 from models.lightning1dit import LightningDiT_models
+from models.text_encoder import FrozenCLIPTextEncoder
 from transport import Sampler, create_transport
 
 
@@ -147,11 +148,18 @@ def sample(cfg):
         use_rmsnorm=m.get("use_rmsnorm", False),
         wo_shift=m.get("wo_shift", False),
         learn_sigma=m.get("learn_sigma", False),
+        cond_dim=m.get("cond_dim", 512),
     )
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Strict: a checkpoint from before CLIP moved out of the DiT carries
+    # y_embedder.text_encoder.* keys and was trained on a re-initialised CLIP.
+    model.load_state_dict(state, strict=True)
     model = model.to(device).eval()   # no gradients, so no DDP wrapper either
-    log(f"Model loaded from {cfg['ckpt_path']} (missing={len(missing)}, "
-        f"unexpected={len(unexpected)})")
+    log(f"Model loaded from {cfg['ckpt_path']}")
+
+    text_encoder = None
+    if use_cfg:
+        text_encoder = FrozenCLIPTextEncoder().to(device)
+        text_encoder.check_dim(m.get("cond_dim", 512))
 
     transport = create_transport(**cfg["transport"])
     sample_fn = Sampler(transport).sample_ode(
@@ -180,9 +188,13 @@ def sample(cfg):
 
         if use_cfg:
             rows = [condition_row(g) for g in slots.tolist()]
-            y = generate_text_conditions(rows, dropout_rate=0.0) + [""] * n
+            # Encoded once per batch, not once per ODE step.
+            emb, uncond = text_encoder.encode(
+                generate_text_conditions(rows, dropout_rate=0.0), device)
+            y = torch.cat([emb, torch.zeros_like(emb)], dim=0)
+            uncond = torch.cat([uncond, torch.ones_like(uncond)], dim=0)
             z = torch.cat([z, z], dim=0)
-            model_kwargs = dict(y=y, cfg_scale=cfg_scale,
+            model_kwargs = dict(y=y, uncond=uncond, cfg_scale=cfg_scale,
                                 cfg_interval=False, cfg_interval_start=0.0)
             model_fn = model.forward_with_cfg
         else:

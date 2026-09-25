@@ -104,9 +104,16 @@ built, and `split_batches` is set off explicitly and asserted (newer Accelerate 
 per-process loader and gathers them back in slot order, so `conditions.csv.gz` row `j` describes
 `samples.pt` row `j` (step 4 numbers patients by sample position); it checks that order before
 saving. Conditioning is text-based CFG:
-condition rows are rendered to prompts by `datasets/condition2text.py` and embedded by a frozen
-`CLIPTextEmbedder`, which is built **unconditionally** — so a CLIP checkpoint is required even at
-`cfg_scale: 0`. Set `dit.runtime.clip_model_path` or `$MELD_CLIP_PATH`.
+condition rows are rendered to prompts by `datasets/condition2text.py` and embedded by
+`models/text_encoder.py`'s `FrozenCLIPTextEncoder`, which `train.py` / `inference.py` own. It is
+**not** a DiT submodule: it stays out of the EMA, the optimizer and the checkpoints, and is loaded
+only when conditioning is used (`data.cond_path` in training, `cfg_scale > 1` in sampling). Set
+`dit.runtime.clip_model_path` or `$MELD_CLIP_PATH` for those runs. The DiT keeps only the trainable
+`TextConditionProjector` (`y_embedder`: projection + `null_embed`), whose input width is
+`dit.model.cond_dim` and must equal CLIP's hidden size. Keep CLIP out of the DiT module tree:
+`initialize_weights()` re-initialises every `nn.Linear` it can reach, which is how the earlier
+in-model CLIP ended up with random weights. DiT checkpoints from before this split are
+incompatible, and `inference.py` loads with `strict=True` so they fail loudly.
 
 **4. Decode** — un-normalises through the training latents' per-channel min/max, decodes, inverts
 the parser, truncates at EOS, writes `syn_<name>_<seed>.csv.gz`.
@@ -175,8 +182,11 @@ one process (`accelerate launch --num_processes 1 --cpu 1_train_vae.py`).
 
 - `.gitignore` excludes `*.csv*`, `*.pt*` and `model/LightningD1T/configs/*.yaml`. **Never commit
   patient data, generated CSVs, or checkpoints** — this project handles real HIV cohort data.
-- `model/LightningD1T/` is vendored. The only local change is `lightning1dit.py`'s CLIP path,
-  which now reads `$MELD_CLIP_PATH` with the original literal as fallback. Keep further edits out
+- `model/LightningD1T/` is vendored. Local changes: `train.py` / `inference.py` (the merged
+  trainer and sampler), and the CLIP split — `models/text_encoder.py` (new, reads
+  `$MELD_CLIP_PATH`, no hard-coded fallback) and `TextConditionProjector` in
+  `lightning1dit.py`, which also dropped the unused `LabelEmbedder` / `QwenTextEmbedder`.
+  Keep further edits out
   of that tree; put translation logic in `dit_adapter.py`.
 - In `4_sample_synthetic_data.py`, `_, max_val, min_val = dp.normalize(...)` has its names swapped
   relative to `DP.normalize`'s `(normalized, min, max)`, but they are passed on positionally in

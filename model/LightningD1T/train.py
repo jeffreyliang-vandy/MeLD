@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 from datasets.condition2text import generate_text_conditions
 from datasets.real_dataset import LatentDataset
 from models.lightning1dit import LightningDiT_models
+from models.text_encoder import FrozenCLIPTextEncoder
 from transport import create_transport
 
 _CKPT_RE = re.compile(r"^(\d+)\.pt$")
@@ -116,6 +117,7 @@ def build_model(cfg):
         wo_shift=m.get("wo_shift", False),
         use_checkpoint=m.get("use_checkpoint", False),
         num_classes=d.get("num_classes", 0),
+        cond_dim=m.get("cond_dim", 512),
     )
 
 
@@ -140,7 +142,9 @@ def train(cfg):
         # Loaders are per process (see the module docstring), so never split a batch again.
         dataloader_config=DataLoaderConfiguration(split_batches=False),
         # With no conditions every sample is unconditional, so y_embedder.projection
-        # never receives a gradient; DDP raises on that unless told to expect it.
+        # never receives a gradient; with conditions, null_embed gets none on a batch
+        # where CFG dropout drops nothing (likely for small per-process batches). DDP
+        # raises on either unless told to expect it.
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
     if accelerator.split_batches:   # would divide the per-process batch a second time
@@ -230,6 +234,13 @@ def train(cfg):
                 f"{per_proc_bs} rows x {world} process(es) x "
                 f"{accelerator.gradient_accumulation_steps} accumulation step(s)")
 
+    # Frozen, so it stays out of the model: no EMA copy, no optimizer, no DDP, and not
+    # in the checkpoints. Loaded only when there is something to condition on.
+    text_encoder = None
+    if d.get("cond_path"):
+        text_encoder = FrozenCLIPTextEncoder().to(accelerator.device)
+        text_encoder.check_dim(cfg["model"].get("cond_dim", 512))
+
     transport = create_transport(**cfg["transport"])
 
     model, opt, loader = accelerator.prepare(model, opt, loader)
@@ -251,8 +262,10 @@ def train(cfg):
             if isinstance(y, torch.Tensor):     # no conditions: y is just the row id
                 model_kwargs = {}
             else:
-                model_kwargs = dict(y=generate_text_conditions(
-                    [list(attrs) for attrs in zip(*y)]))
+                emb, uncond = text_encoder.encode(
+                    generate_text_conditions([list(attrs) for attrs in zip(*y)]),
+                    accelerator.device)
+                model_kwargs = dict(y=emb, uncond=uncond)
 
             with accelerator.accumulate(model):
                 with accelerator.autocast():

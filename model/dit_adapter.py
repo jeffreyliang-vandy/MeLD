@@ -169,8 +169,8 @@ def run(cfg, phase, dry_run=False):
     env = dict(os.environ)
     clip = cfg.dit.runtime.clip_model_path
     if clip:
-        # Consumed by CLIPTextEmbedder, which upstream hardcodes to an absolute path
-        # on the original author's machine.
+        # Consumed by models/text_encoder.py's FrozenCLIPTextEncoder, which the DiT
+        # trainer and sampler load only when conditioning is used.
         env["MELD_CLIP_PATH"] = str(clip)
     # The vendored modules use flat imports (`from models...`), so they must resolve
     # against their own directory.

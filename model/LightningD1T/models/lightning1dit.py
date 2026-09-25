@@ -9,7 +9,6 @@ Enjoy everyone, DiT strikes back!
 by Maple (Jingfeng Yao) from HUST-VL
 """
 
-import os
 import math
 import numpy as np
 
@@ -148,294 +147,41 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class LabelEmbedder(nn.Module):
+class TextConditionProjector(nn.Module):
     """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    Same as DiT.
+    MeLD: the trainable half of text conditioning. The frozen CLIP encoder lives outside
+    the DiT (models/text_encoder.py); this maps its pooled embeddings to the DiT hidden
+    size and substitutes a learned null embedding for unconditional / CFG-dropped rows.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
-
-    @torch.compile
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-        return embeddings
-
-from transformers import CLIPTokenizer, CLIPTextModel
-class CLIPTextEmbedder(nn.Module):
-    def __init__(
-        self,
-        hidden_size,
-        # MeLD: read from the environment so the checkpoint location is not pinned to
-        # one machine. model/dit_adapter.py sets this from dit.runtime.clip_model_path.
-        model_name=None,
-        dropout_prob=0.1,
-    ):
+    def __init__(self, cond_dim, hidden_size, dropout_prob=0.1):
         super().__init__()
         self.dropout_prob = dropout_prob
-        self.hidden_size = hidden_size
-
-        if model_name is None:
-            model_name = os.environ.get(
-                "MELD_CLIP_PATH",
-                "/home/jeffrey/Documents/EA_project/save/clip-hf-model")
-        print(f"Loading CLIP model: {model_name}...")
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
-        self.text_encoder = CLIPTextModel.from_pretrained(model_name)
-
-        for param in self.text_encoder.parameters():
-            param.requires_grad = False
-        self.text_encoder.eval()
-
-        clip_output_dim = self.text_encoder.config.hidden_size
         self.projection = nn.Sequential(
-            nn.Linear(clip_output_dim, hidden_size),
+            nn.Linear(cond_dim, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size)
         )
-
         # Learned unconditional embedding in DiT hidden space.
         self.null_embed = nn.Parameter(torch.zeros(hidden_size))
         nn.init.normal_(self.null_embed, std=0.02)
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        # Keep frozen CLIP in eval mode at all times.
-        self.text_encoder.eval()
-        return self
-
-    def _normalize_text_list(self, text_list, batch_size=None):
+    def forward(self, y, uncond=None):
         """
-        Normalize input into a Python list[str | None] of length batch_size.
-        Rules:
-        - None -> unconditional
-        - "" or whitespace-only -> unconditional
-        - non-string values are converted to str
+        y:      (N, cond_dim) pooled text embeddings
+        uncond: (N,) bool, True where the row is unconditional; None -> all conditional
         """
-        if text_list is None:
-            if batch_size is None:
-                raise ValueError("batch_size must be provided when text_list is None")
-            return [None] * batch_size
-
-        if isinstance(text_list, str):
-            text_list = [text_list]
-
-        normalized = []
-        for text in text_list:
-            if text is None:
-                normalized.append(None)
-            elif isinstance(text, str):
-                stripped = text.strip()
-                normalized.append(None if stripped == "" else stripped)
-            else:
-                text = str(text).strip()
-                normalized.append(None if text == "" else text)
-        return normalized
-
-    def _get_drop_mask(self, batch_size, device, force_drop_ids=None):
-        """
-        Returns a boolean mask of shape (batch_size,) where True means unconditional.
-        """
-        if force_drop_ids is not None:
-            return force_drop_ids.to(device=device).bool()
-
+        batch_size = y.shape[0]
+        if uncond is None:
+            uncond = torch.zeros(batch_size, dtype=torch.bool, device=y.device)
         if self.training and self.dropout_prob > 0:
-            return torch.rand(batch_size, device=device) < self.dropout_prob
+            uncond = uncond | (torch.rand(batch_size, device=y.device) < self.dropout_prob)
 
-        return torch.zeros(batch_size, device=device, dtype=torch.bool)
-
-    def forward(self, text_list, train, force_drop_ids=None):
-        """
-        text_list:
-            - None
-            - list[str | None]
-            - single string
-
-        Behavior:
-        - unconditional samples (None / "" / whitespace / dropped) always map to null_embed
-        - only conditional samples are run through CLIP + projection
-        """
-        device = self.projection[0].weight.device
-
-        # Respect the caller's train flag for CFG dropout logic, while CLIP itself stays eval.
-        was_training = self.training
-        if train != was_training:
-            self.training = train
-
-        batch_size = None
-        if isinstance(text_list, (list, tuple)):
-            batch_size = len(text_list)
-
-        text_list = self._normalize_text_list(text_list, batch_size=batch_size)
-        batch_size = len(text_list)
-
-        # Base unconditional mask from None / empty strings.
-        empty_mask = torch.tensor(
-            [text is None for text in text_list],
-            device=device,
-            dtype=torch.bool,
-        )
-
-        # CFG drop mask.
-        drop_mask = self._get_drop_mask(batch_size, device, force_drop_ids=force_drop_ids)
-
-        # Final unconditional mask.
-        uncond_mask = empty_mask | drop_mask
-
-        # Initialize all outputs as null embeddings.
         embeddings = self.null_embed.unsqueeze(0).expand(batch_size, -1).clone()
-
-        # Encode only conditional samples.
-        cond_indices = (~uncond_mask).nonzero(as_tuple=False).flatten()
+        cond_indices = (~uncond).nonzero(as_tuple=False).flatten()
         if cond_indices.numel() > 0:
-            cond_texts = [text_list[i] for i in cond_indices.tolist()]
-
-            max_len = min(
-                self.tokenizer.model_max_length,
-                self.text_encoder.config.max_position_embeddings,
-            )
-
-            inputs = self.tokenizer(
-                cond_texts,
-                padding=True,
-                truncation=True,
-                max_length=max_len,
-                return_tensors="pt",
-            ).to(device)
-
-            with torch.no_grad():
-                outputs = self.text_encoder(**inputs)
-                pooled_output = outputs.pooler_output
-
-            cond_embeddings = self.projection(pooled_output.float())
-            embeddings[cond_indices] = cond_embeddings
-
-        # Restore module training flag if we changed it.
-        if train != was_training:
-            self.training = was_training
-
+            embeddings[cond_indices] = self.projection(y[cond_indices].float()).to(embeddings.dtype)
         return embeddings
 
-
-from transformers import AutoTokenizer, AutoModel
-class QwenTextEmbedder(nn.Module):
-    def __init__(self, hidden_size, model_name="Qwen/Qwen3-Embedding-8B", dropout_prob=0.1):
-        super().__init__()
-        self.dropout_prob = dropout_prob
-        self.hidden_size = hidden_size
-
-        print(f"Loading Qwen model: {model_name}...")
-        
-        # 1. Load Pre-trained Qwen
-        # Note: trust_remote_code=True is often required for Qwen models.
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        
-        # Important: Qwen/LLMs often don't have a pad token by default. 
-        # We set it to EOS for batch processing.
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Load model in half-precision (bfloat16 or float16) to save memory. 
-        # An 8B model requires ~16GB VRAM in fp16.
-        self.base_model = AutoModel.from_pretrained(
-            model_name, 
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-            device_map="auto"  # Automatically splits across GPUs/CPU if needed
-        )
-
-        # 2. Freeze the Base Model
-        for param in self.base_model.parameters():
-            param.requires_grad = False
-        
-        # 3. Projection Layer
-        # Dynamically get the hidden size (likely 4096 for an 8B model)
-        base_model_dim = self.base_model.config.hidden_size
-        
-        self.projection = nn.Sequential(
-            nn.Linear(base_model_dim, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size)
-        )
-
-    def token_drop(self, text_list, force_drop_ids=None):
-        """
-        Replaces text with empty strings "" for Classifier-Free Guidance (CFG).
-        """
-        new_text_list = []
-        for i, text in enumerate(text_list):
-            drop = False
-            if force_drop_ids is not None:
-                if force_drop_ids[i] == 1:
-                    drop = True
-            elif self.dropout_prob > 0 and torch.rand(1).item() < self.dropout_prob:
-                drop = True
-            
-            new_text_list.append("" if drop else text)
-        return new_text_list
-
-    def forward(self, text_list, train, force_drop_ids=None):
-        """
-        text_list: List of strings
-        """
-        # Ensure projection is on the same device as the model output will be
-        device = self.projection[0].weight.device
-        
-        # 1. Handle CFG (Dropout)
-        if (train and self.dropout_prob > 0) or (force_drop_ids is not None):
-            text_list = self.token_drop(text_list, force_drop_ids)
-
-        # 2. Tokenize
-        # Note: Qwen context window is large, but for tabular data/embeddings
-        # we can stick to a reasonable length (e.g., 128 or 256) to save VRAM.
-        inputs = self.tokenizer(
-            text_list, 
-            padding=True, 
-            truncation=True, 
-            max_length=128, 
-            return_tensors="pt"
-        ).to(self.base_model.device) # Move inputs to where the base model is
-
-        # 3. Encode with Qwen (No Gradients)
-        with torch.no_grad():
-            outputs = self.base_model(**inputs)
-            
-            # Extract Last Token Pooling (Standard for Causal LLM Embeddings)
-            # outputs.last_hidden_state shape: (Batch, Seq_Len, Hidden_Dim)
-            hidden_states = outputs.last_hidden_state
-            
-            # We need to grab the embedding corresponding to the last real token (EOS),
-            # ignoring padding tokens.
-            # Create a range vector [0, 1, 2, ... Batch-1]
-            batch_size = hidden_states.shape[0]
-            sequence_lengths = inputs.attention_mask.sum(dim=1) - 1
-            
-            # Select the vector at the last valid index for each item in batch
-            pooled_output = hidden_states[torch.arange(batch_size, device=hidden_states.device), sequence_lengths]
-
-        # 4. Project to DiT dimension
-        # Ensure pooled_output is float32 if projection layer is float32
-        embeddings = self.projection(pooled_output.float().to(device))
-        
-        return embeddings
 
 class LightningDiTBlock(nn.Module):
     """
@@ -564,6 +310,7 @@ class LightningDiT(nn.Module):
         use_rmsnorm=False,
         wo_shift=False,
         use_checkpoint=False,
+        cond_dim=512,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -580,8 +327,9 @@ class LightningDiT(nn.Module):
         # self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.x_embedder = PatchEmbed1D(in_channels, hidden_size, patch_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        # self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        self.y_embedder = CLIPTextEmbedder(hidden_size, dropout_prob=class_dropout_prob)
+        # MeLD: CLIP is not a submodule (initialize_weights would re-init it); callers pass
+        # pooled embeddings from models/text_encoder.py.
+        self.y_embedder = TextConditionProjector(cond_dim, hidden_size, dropout_prob=class_dropout_prob)
         # num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -632,9 +380,6 @@ class LightningDiT(nn.Module):
         nn.init.xavier_uniform_(w.view(w.shape[0], w.shape[1]*w.shape[2]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        # Initialize label embedding table:
-        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -667,12 +412,13 @@ class LightningDiT(nn.Module):
         x = x.permute(0, 3, 1, 2).reshape(N, C, T * P)
         return x
 
-    def forward(self, x, t=None, y=None):
+    def forward(self, x, t=None, y=None, uncond=None):
         """
         Forward pass of LightningDiT.
         x: (N, C, L) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        y: (N, cond_dim) pooled text embeddings, or None for all-unconditional
+        uncond: (N,) bool, True where a row is unconditional; None -> none are
         use_checkpoint: boolean to toggle checkpointing
         """
 
@@ -681,9 +427,10 @@ class LightningDiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = L/ patch_size ** 2
         # print(f"x embeded size:{x.shape}")
         t = self.t_embedder(t)                   # (N, D)
-        if y is None:
-            y = [""] * x.shape[0] #empty strings for unconditional generation
-        y = self.y_embedder(y, self.training)    # (N, D)    
+        if y is None:   # unconditional generation: every row maps to null_embed
+            y = x.new_zeros(x.shape[0], self.y_embedder.projection[0].in_features)
+            uncond = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+        y = self.y_embedder(y, uncond)           # (N, D)
         c = t + y                                # (N, D)
 
         for block in self.blocks:
@@ -701,15 +448,17 @@ class LightningDiT(nn.Module):
             x, _ = x.chunk(2, dim=1)
         return x # (N,C,L)
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, cfg_interval=None, cfg_interval_start=None):
+    def forward_with_cfg(self, x, t, y, uncond, cfg_scale, cfg_interval=None, cfg_interval_start=None):
         """
         Forward pass of LightningDiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
+        n = len(half)
         combined = torch.cat([half, half], dim=0)
-        y = y[:len(half)] + [""] * len(half)
-        model_out = self.forward(combined, t, y)
+        y = torch.cat([y[:n], y[:n]], dim=0)
+        uncond = torch.cat([uncond[:n], torch.ones_like(uncond[:n])], dim=0)
+        model_out = self.forward(combined, t, y, uncond)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
