@@ -24,6 +24,11 @@ _SAMPLE_SECTIONS = ("data", "model", "train", "optimizer", "transport", "sample"
 
 _CKPT_RE = re.compile(r"^(\d+)\.pt$")
 
+# One trainer and one sampler, each for one or many processes; `dit.runtime.launcher`
+# decides which (e.g. [accelerate, launch, --num_processes, "4"]).
+TRAIN_ENTRY = "train.py"
+SAMPLE_ENTRY = "inference.py"
+
 
 class DitAdapterError(Exception):
     pass
@@ -32,10 +37,9 @@ class DitAdapterError(Exception):
 def _prune_nulls(node, _in_transport=False):
     """Drop null-valued keys, because the vendored code branches on key presence.
 
-    `train_single.py` does `if "weight_init" in cfg["train"]` and then
+    `train.py` does `if "weight_init" in cfg["train"]` and then
     `torch.load(cfg["train"]["weight_init"])`, so emitting an explicit null turns a
-    skipped branch into `torch.load(None)`. Same shape of problem for `data.image_size`
-    and a top-level `vae` key, which switch entire code paths.
+    skipped branch into `torch.load(None)`.
 
     `transport` is exempt: it is splatted into create_transport(), whose defaults for
     loss_weight/train_eps/sample_eps are None and meaningful.
@@ -49,22 +53,6 @@ def _prune_nulls(node, _in_transport=False):
         elif value is not None or _in_transport:
             out[key] = value
     return out
-
-
-def _encode_mixed_precision(value, entry):
-    """The two trainers disagree about this key's type.
-
-    train_multigpu.py hands it to Accelerate and wants "no"/"fp16"/"bf16";
-    train_single.py hands it to GradScaler(enabled=...) and wants a bool -- where any
-    non-empty string, "no" included, is truthy and would silently enable the scaler.
-    """
-    if entry == "train_single.py":
-        if isinstance(value, str):
-            return value.lower() not in ("", "no", "none", "false")
-        return bool(value)
-    if isinstance(value, bool):
-        return "bf16" if value else "no"
-    return str(value)
 
 
 def _latent_shape(path):
@@ -126,14 +114,6 @@ def to_vendored(cfg, phase):
             f"dit.data.seq_len could not be derived: no latent file at "
             f"{out['data'].get('data_path')}. Run step 2 first, or set it explicitly.")
 
-    entry = dit["runtime"]["entry_train" if phase == "train" else "entry_sample"]
-    if "mixed_precision" in out.get("train", {}):
-        out["train"]["mixed_precision"] = _encode_mixed_precision(
-            out["train"]["mixed_precision"], dit["runtime"]["entry_train"])
-    # Only train_multigpu.py reads train.seed; harmless elsewhere but keep it honest.
-    if entry != "train_multigpu.py":
-        out.get("train", {}).pop("seed", None)
-
     if phase == "sample":
         ckpt_step = dit.get("inference", {}).get("ckpt_step")
         if ckpt_step is None:
@@ -175,8 +155,7 @@ def run(cfg, phase, dry_run=False):
     if not os.path.isdir(dit_dir):
         raise DitAdapterError(f"vendored DiT not found at {dit_dir}")
 
-    entry = str(cfg.dit.runtime.entry_train if phase == "train"
-                else cfg.dit.runtime.entry_sample)
+    entry = TRAIN_ENTRY if phase == "train" else SAMPLE_ENTRY
     if not os.path.exists(os.path.join(dit_dir, entry)):
         raise DitAdapterError(f"entry point not found: {os.path.join(dit_dir, entry)}")
 

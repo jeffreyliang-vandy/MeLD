@@ -1,376 +1,220 @@
-# sample_accelerate.py
+"""LightningDiT 1-D sequence sampling: one script for one process or many.
+
+    python inference.py --config cfg.yaml                    # single process
+    accelerate launch inference.py --config cfg.yaml         # multi-GPU
+
+Config keys read (see configs/meld_default.yaml, `dit:`):
+    ckpt_path, output_dir            set by model/dit_adapter.py
+    data.seq_len, model.*            architecture, as in training
+    sample.total                     number of samples to generate
+    sample.batch_size                GLOBAL batch per step; each process handles
+                                     batch_size / num_processes of it (divisibility checked)
+    sample.cfg_scale                 above 1.0 enables classifier-free guidance (a condition
+                                     table is then required); otherwise unconditional
+    sample.cond_path                 condition table, used only when guidance is on
+    sample.seed                      seeds the noise, prompts and condition order
+    sample.{sampling_method,num_sampling_steps,atol,rtol,reverse,timestep_shift}
+
+Sharding and ordering. Sample `g` (g = 0..total-1) is one "slot". A per-process DataLoader
+walks the slots; Accelerate (`split_batches=False`) deals whole batches to the ranks
+round-robin, so at step s rank r holds batch s*W + r. `gather_for_metrics` concatenates in
+rank order and drops the rows padded onto a short last step, which restores slot order
+exactly. This is asserted before saving rather than assumed.
+
+Conditions. With guidance on, slot g uses condition row `perm[g % N]`, where `perm` is a
+permutation of the N table rows seeded by `sample.seed`: every row is used before any is
+reused. `conditions.csv.gz` row j therefore describes `samples.pt` row j, which
+4_sample_synthetic_data.py relies on (it numbers patients by sample position).
+
+Outputs, in `<output_dir>/samples-<total>-cfg<cfg_scale>/`:
+    samples.pt           (total, seq_len, in_chans)
+    conditions.csv.gz    (total rows; only when guidance is on)
+
+Reproducibility: noise, prompt part order and condition order are seeded from
+`sample.seed` (+ rank), so a run repeats exactly for the same process count.
 """
-LightningDiT 1-D sequence sampling with Accelerate + batch splitting
-====================================================================
-
-Usage
------
-Single process:
-    python sample_accelerate.py --config configs/sample.yaml
-
-With Accelerate:
-    accelerate launch sample_accelerate.py --config configs/sample.yaml
-
-Required YAML fields
---------------------
-ckpt_path : path to EMA checkpoint (*.pt)
-
-data:
-    seq_len       : length L
-    in_chans      : number of variables C
-
-model:
-    model_type    : key in LightningDiT_models
-    in_chans      : number of input channels
-
-sample:
-    total                 : total number of samples across all processes
-    batch_size            : logical per-process batch size
-    micro_batch_size      : micro-batch size used for batch splitting
-    cfg_scale             : 0 (=disabled) or >1 for classifier-free guidance
-    num_sampling_steps    : diffusion steps for ODE sampler
-    cond_path             : optional condition dataset path
-
-Notes
------
-- `batch_size` is the logical batch size per process.
-- `micro_batch_size` is the chunk size used inside each process to reduce memory.
-- Final outputs are merged on the main process into:
-      samples.pt
-      conditions.csv.gz   (if conditional sampling is enabled)
-"""
-
-import os
-import math
-import yaml
 import argparse
+import os
+import random
 from time import strftime
 
 import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
+import yaml
 from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
-from models.lightning1dit import LightningDiT_models
-from transport import create_transport, Sampler
-from datasets.real_dataset import ConditionDataset
 from datasets.condition2text import generate_text_conditions
+from datasets.real_dataset import ConditionDataset
+from models.lightning1dit import LightningDiT_models
+from transport import Sampler, create_transport
 
 
-# ------------------------------------------------------------------ #
-#                        helper utils                                #
-# ------------------------------------------------------------------ #
+# ------------------------------ utils -------------------------------- #
 def load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
 
-def log(accelerator, msg):
-    t = strftime("%Y-%m-%d %H:%M:%S")
-    accelerator.print(f"\033[34m[LightningDiT-Sample {t}]\033[0m {msg}", flush=True)
+class SampleSlots(Dataset):
+    """Slot g -> the tensor g. Slots stand for samples still to be generated."""
+
+    def __init__(self, total):
+        self.total = total
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, g):
+        return torch.tensor(g, dtype=torch.long)
 
 
-def split_evenly(total, world_size, rank):
-    """
-    Split `total` items across ranks as evenly as possible.
-    Returns the number assigned to this rank.
-    """
-    base = total // world_size
-    rem = total % world_size
-    return base + (1 if rank < rem else 0)
+def per_process_batch(batch_size, num_processes):
+    if batch_size % num_processes:
+        raise ValueError(f"sample.batch_size ({batch_size}) must be divisible by the "
+                         f"number of processes ({num_processes})")
+    return batch_size // num_processes
 
 
-def build_output_dir(cfg):
-    return os.path.join(
-        cfg["output_dir"],
-        f"samples-{cfg['sample']['total']}-cfg{cfg['sample']['cfg_scale']}"
-    )
+def condition_order(n_rows, seed):
+    """Seeded permutation of the condition rows; slot g uses order[g % n_rows]."""
+    return np.random.default_rng(seed).permutation(n_rows)
 
 
-def save_local_shard(out_dir, rank, samples, condition_rows=None):
-    samples_path = os.path.join(out_dir, f"samples_rank{rank:03d}.pt")
-    torch.save(samples, samples_path)
-
-    if condition_rows is not None and len(condition_rows) > 0:
-        cond_path = os.path.join(out_dir, f"conditions_rank{rank:03d}.csv.gz")
-        df = pd.DataFrame(
-            [dict(item.split(": ", 1) for item in row) for row in condition_rows]
-        )
-        df.to_csv(cond_path, compression="gzip", index=False)
+def condition_frame(rows):
+    """Rows of "column: value" strings -> a DataFrame, as the trainer's dataset builds them."""
+    return pd.DataFrame([dict(item.split(": ", 1) for item in row) for row in rows])
 
 
-def merge_shards(out_dir, world_size, save_conditions):
-    sample_shards = []
-    cond_shards = []
-
-    for rank in range(world_size):
-        sample_path = os.path.join(out_dir, f"samples_rank{rank:03d}.pt")
-        if os.path.exists(sample_path):
-            sample_shards.append(torch.load(sample_path, map_location="cpu"))
-
-        if save_conditions:
-            cond_path = os.path.join(out_dir, f"conditions_rank{rank:03d}.csv.gz")
-            if os.path.exists(cond_path):
-                cond_shards.append(pd.read_csv(cond_path, compression="gzip"))
-
-    if len(sample_shards) == 0:
-        raise RuntimeError("No sample shards were found to merge.")
-
-    merged_samples = torch.cat(sample_shards, dim=0)
-    torch.save(merged_samples, os.path.join(out_dir, "samples.pt"))
-
-    if save_conditions and len(cond_shards) > 0:
-        merged_conditions = pd.concat(cond_shards, ignore_index=True)
-        merged_conditions.to_csv(
-            os.path.join(out_dir, "conditions.csv.gz"),
-            compression="gzip",
-            index=False,
-        )
-
-    # Optional cleanup of shard files
-    for rank in range(world_size):
-        sample_path = os.path.join(out_dir, f"samples_rank{rank:03d}.pt")
-        if os.path.exists(sample_path):
-            os.remove(sample_path)
-
-        cond_path = os.path.join(out_dir, f"conditions_rank{rank:03d}.csv.gz")
-        if os.path.exists(cond_path):
-            os.remove(cond_path)
-
-
-# ------------------------------------------------------------------ #
-#                     micro-batched sampling                         #
-# ------------------------------------------------------------------ #
-@torch.no_grad()
-def run_sampling_microbatched(
-    *,
-    model,
-    sample_fn,
-    seq_len,
-    in_chans,
-    total_batch,
-    micro_batch_size,
-    use_cfg,
-    cfg_scale,
-    dataset,
-    rng,
-    device,
-):
-    """
-    Generate `total_batch` samples on this process, split into micro-batches.
-
-    Returns
-    -------
-    samples_cpu : Tensor of shape [total_batch, seq_len, in_chans] on CPU
-    used_conditions : list[str]
-        Raw condition rows used for conditional sampling.
-    """
-    out_chunks = []
-    used_conditions = []
-
-    remaining = total_batch
-    while remaining > 0:
-        m = min(micro_batch_size, remaining)
-
-        z = torch.randn(m, in_chans, seq_len, device=device)
-
-        if use_cfg:
-            if dataset is None:
-                raise ValueError("cfg_scale > 1 but no conditional dataset was provided.")
-
-            z = torch.cat([z, z], dim=0)
-
-            indices = rng.choice(len(dataset), size=m, replace=True)
-            local_conditions = [dataset[i] for i in indices]
-            used_conditions.extend(dataset.cond_data[i] for i in indices)
-
-            y = generate_text_conditions(local_conditions, dropout_rate=0.0)
-            y_null = [""] * m
-            y = y + y_null
-
-            model_kwargs = dict(
-                y=y,
-                cfg_scale=cfg_scale,
-                cfg_interval=False,
-                cfg_interval_start=0.0,
-            )
-            model_fn = model.forward_with_cfg
-        else:
-            model_kwargs = {}
-            model_fn = model.forward
-
-        samples = sample_fn(z, model_fn, **model_kwargs)[-1]
-
-        if use_cfg:
-            samples, _ = samples.chunk(2, dim=0)
-
-        out_chunks.append(samples.cpu().permute(0, 2, 1))
-        remaining -= m
-
-    return torch.cat(out_chunks, dim=0), used_conditions
-
-
-# ------------------------------------------------------------------ #
-#                     main sampling routine                          #
-# ------------------------------------------------------------------ #
+# ------------------------- main sampling routine --------------------- #
 @torch.no_grad()
 def sample(cfg):
-    accelerator = Accelerator()
-    device = accelerator.device
+    s = cfg["sample"]
+    accelerator = Accelerator(dataloader_config=DataLoaderConfiguration(split_batches=False))
+    if accelerator.split_batches:   # would divide the per-process batch a second time
+        raise RuntimeError("split_batches must be off: the loaders are already per process")
+    device, is_main = accelerator.device, accelerator.is_main_process
+    world, rank = accelerator.num_processes, accelerator.process_index
 
-    log(
-        accelerator,
-        f"Sampling on device={device}, rank={accelerator.process_index}/{accelerator.num_processes}, "
-        f"mixed_precision={accelerator.mixed_precision}",
-    )
+    def log(msg):
+        accelerator.print(f"\033[34m[LightningDiT-Sample {strftime('%Y-%m-%d %H:%M:%S')}]"
+                          f"\033[0m {msg}", flush=True)
 
-    # --------------------------- model ------------------------------ #
+    total = int(s["total"])
+    batch_size = int(s["batch_size"])
+    per_proc = per_process_batch(batch_size, world)
+    cfg_scale = float(s["cfg_scale"])
+    use_cfg = cfg_scale > 1.0
+    seed = int(s.get("seed", 42))
+    in_chans = cfg["model"]["in_chans"]
+    seq_len = cfg["data"]["seq_len"]
+
+    # Different streams per rank, identical from run to run.
+    random.seed(seed + rank)
+    np.random.seed((seed + rank) % 2**32)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + rank)
+
+    dataset = order = None
+    if use_cfg:
+        cond_path = s.get("cond_path")
+        if cond_path is None:
+            raise ValueError(f"sample.cfg_scale is {cfg_scale} (> 1.0 enables guidance), "
+                             f"which needs sample.cond_path")
+        dataset = ConditionDataset(data_dir=cond_path)
+        if len(dataset) == 0:
+            raise ValueError(f"the condition table at {cond_path} is empty")
+        order = condition_order(len(dataset), seed)
+
+    def condition_row(g):
+        return dataset.cond_data[int(order[g % len(dataset)])]
+
+    # model ------------------------------------------------------------ #
     ckpt = torch.load(cfg["ckpt_path"], map_location="cpu")
     state = ckpt["ema"] if "ema" in ckpt else ckpt
-
-    seq_len = cfg["data"]["seq_len"]
-    patch = cfg["model"].get("patch_size", 1)
-    tokens = seq_len // patch
-
-    model = LightningDiT_models[cfg["model"]["model_type"]](
-        input_size=tokens,
-        in_channels=cfg["model"]["in_chans"],
-        seq_len=cfg["data"]["seq_len"],
+    m = cfg["model"]
+    model = LightningDiT_models[m["model_type"]](
+        input_size=seq_len // m.get("patch_size", 1),
+        in_channels=in_chans,
+        seq_len=seq_len,
         num_classes=cfg["data"].get("num_classes", 0),
-        use_qknorm=cfg["model"].get("use_qknorm", False),
-        use_swiglu=cfg["model"].get("use_swiglu", False),
-        use_rope=cfg["model"].get("use_rope", False),
-        use_rmsnorm=cfg["model"].get("use_rmsnorm", False),
-        wo_shift=cfg["model"].get("wo_shift", False),
-        learn_sigma=cfg["model"].get("learn_sigma", False),
+        use_qknorm=m.get("use_qknorm", False),
+        use_swiglu=m.get("use_swiglu", False),
+        use_rope=m.get("use_rope", False),
+        use_rmsnorm=m.get("use_rmsnorm", False),
+        wo_shift=m.get("wo_shift", False),
+        learn_sigma=m.get("learn_sigma", False),
     )
-    model.load_state_dict(state, strict=False)
-    model.eval()
-    model = model.to(device)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    model = model.to(device).eval()   # no gradients, so no DDP wrapper either
+    log(f"Model loaded from {cfg['ckpt_path']} (missing={len(missing)}, "
+        f"unexpected={len(unexpected)})")
 
-    # Accelerator wraps the model for distributed execution
-    model = accelerator.prepare(model)
-
-    # Use the underlying module for custom methods like forward_with_cfg
-    unwrapped_model = accelerator.unwrap_model(model)
-
-    log(accelerator, "Model loaded.")
-
-    # --------------------------- transport / sampler --------------- #
     transport = create_transport(**cfg["transport"])
-    sampler = Sampler(transport)
-    sample_fn = sampler.sample_ode(
-        sampling_method=cfg["sample"].get("sampling_method", "heun"),
-        num_steps=cfg["sample"]["num_sampling_steps"],
-        atol=cfg["sample"].get("atol", 1e-5),
-        rtol=cfg["sample"].get("rtol", 1e-5),
-        reverse=cfg["sample"].get("reverse", False),
-        timestep_shift=cfg["sample"].get("timestep_shift", 0.0),
+    sample_fn = Sampler(transport).sample_ode(
+        sampling_method=s.get("sampling_method", "heun"),
+        num_steps=s["num_sampling_steps"],
+        atol=s.get("atol", 1e-5),
+        rtol=s.get("rtol", 1e-5),
+        reverse=s.get("reverse", False),
+        timestep_shift=s.get("timestep_shift", 0.0),
     )
 
-    # --------------------------- output dir ------------------------ #
-    out_dir = build_output_dir(cfg)
-    if accelerator.is_main_process:
+    out_dir = os.path.join(cfg["output_dir"], f"samples-{s['total']}-cfg{s['cfg_scale']}")
+    if is_main:
         os.makedirs(out_dir, exist_ok=True)
     accelerator.wait_for_everyone()
-    log(accelerator, f"Saving tensors to {out_dir}")
 
-    # --------------------------- conditional data ------------------ #
-    dataset = None
-    condition_path = cfg["sample"].get("cond_path", None)
-    if condition_path is not None:
-        log(accelerator, f"Loading conditional dataset from {condition_path}")
-        dataset = ConditionDataset(data_dir=condition_path)
+    loader = accelerator.prepare(
+        DataLoader(SampleSlots(total), batch_size=per_proc, shuffle=False, drop_last=False))
+    log(f"Sampling {total} on {world} process(es): global batch {batch_size} = "
+        f"{per_proc} rows x {world}; guidance={'on' if use_cfg else 'off'}; out={out_dir}")
 
-    # --------------------------- generate config ------------------- #
-    total = int(cfg["sample"]["total"])
-    batch_size = int(cfg["sample"]["batch_size"])
-    micro_batch_size = batch_size // accelerator.num_processes
-    cfg_scale = float(cfg["sample"]["cfg_scale"])
-    use_cfg = cfg_scale >= 1.0
+    samples_out, slots_out = [], []
+    for slots in tqdm(loader, total=len(loader), disable=not accelerator.is_local_main_process):
+        n = slots.shape[0]
+        z = torch.randn(n, in_chans, seq_len, device=device, generator=generator)
 
-    if micro_batch_size <= 0:
-        raise ValueError("sample.micro_batch_size must be > 0")
-    if micro_batch_size > batch_size:
-        micro_batch_size = batch_size
-
-    local_total = split_evenly(total, accelerator.num_processes, accelerator.process_index)
-    local_steps = math.ceil(local_total / batch_size) if local_total > 0 else 0
-
-    log(
-        accelerator,
-        f"Global total={total}, local total={local_total}, "
-        f"batch_size={batch_size}, micro_batch_size={micro_batch_size}, use_cfg={use_cfg}",
-    )
-
-    # Rank-specific RNG for reproducible but distinct conditional draws
-    base_seed = int(cfg["sample"].get("seed", 42))
-    rng = np.random.default_rng(base_seed + accelerator.process_index)
-
-    local_sample_chunks = []
-    local_condition_rows = []
-
-    produced = 0
-    iterator = range(local_steps)
-    if accelerator.is_local_main_process:
-        iterator = tqdm(iterator, total=local_steps)
-
-    for _ in iterator:
-        current_batch = min(batch_size, local_total - produced)
-
-        samples_cpu, used_conditions = run_sampling_microbatched(
-            model=unwrapped_model,
-            sample_fn=sample_fn,
-            seq_len=seq_len,
-            in_chans=cfg["model"]["in_chans"],
-            total_batch=current_batch,
-            micro_batch_size=micro_batch_size,
-            use_cfg=use_cfg,
-            cfg_scale=cfg_scale,
-            dataset=dataset,
-            rng=rng,
-            device=device,
-        )
-
-        local_sample_chunks.append(samples_cpu)
         if use_cfg:
-            local_condition_rows.extend(used_conditions)
+            rows = [condition_row(g) for g in slots.tolist()]
+            y = generate_text_conditions(rows, dropout_rate=0.0) + [""] * n
+            z = torch.cat([z, z], dim=0)
+            model_kwargs = dict(y=y, cfg_scale=cfg_scale,
+                                cfg_interval=False, cfg_interval_start=0.0)
+            model_fn = model.forward_with_cfg
+        else:
+            model_kwargs, model_fn = {}, model.forward
 
-        produced += current_batch
+        out = sample_fn(z, model_fn, **model_kwargs)[-1]
+        if use_cfg:
+            out, _ = out.chunk(2, dim=0)   # drop the unconditional half
 
-    if len(local_sample_chunks) == 0:
-        local_samples = torch.empty(0, seq_len, cfg["model"]["in_chans"])
-    else:
-        local_samples = torch.cat(local_sample_chunks, dim=0)[:local_total]
-
-    log(accelerator, f"Rank {accelerator.process_index}: sampling done, saving local shard.")
-
-    save_local_shard(
-        out_dir=out_dir,
-        rank=accelerator.process_index,
-        samples=local_samples,
-        condition_rows=local_condition_rows if use_cfg else None,
-    )
+        # Rank order within a step + drop of wrapped padding rows == slot order.
+        out = accelerator.gather_for_metrics(out.permute(0, 2, 1).contiguous())
+        slots = accelerator.gather_for_metrics(slots)
+        if is_main:
+            samples_out.append(out.cpu())
+            slots_out.append(slots.cpu())
 
     accelerator.wait_for_everyone()
+    if is_main:
+        samples = torch.cat(samples_out)
+        if not torch.equal(torch.cat(slots_out), torch.arange(total)):
+            raise RuntimeError("gathered samples are not in slot order; refusing to save "
+                               "samples that would not match their conditions")
+        torch.save(samples, os.path.join(out_dir, "samples.pt"))
+        if use_cfg:
+            condition_frame([condition_row(g) for g in range(total)]).to_csv(
+                os.path.join(out_dir, "conditions.csv.gz"), compression="gzip", index=False)
+        log(f"Saved {total} samples to {out_dir}")
 
-    if accelerator.is_main_process:
-        merge_shards(
-            out_dir=out_dir,
-            world_size=accelerator.num_processes,
-            save_conditions=use_cfg,
-        )
-        log(accelerator, f"Saved {total} merged samples to {out_dir}")
 
-
-# ------------------------------------------------------------------ #
-#                            entry                                   #
-# ------------------------------------------------------------------ #
+# ------------------------------ entry -------------------------------- #
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="YAML config")
     args = parser.parse_args()
-
-    cfg = load_yaml(args.config)
-    sample(cfg)
+    sample(load_yaml(args.config))

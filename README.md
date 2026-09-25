@@ -72,7 +72,9 @@ Multi-GPU VAE training uses the same script and config:
 accelerate launch 1_train_vae.py --config configs/my_run.yaml
 ```
 
-`3_train_DiT.py` runs the DiT in its own environment as a subprocess; set `dit.runtime.python`
+`3_train_DiT.py` trains with one script for any number of GPUs: set `dit.runtime.launcher` to
+`[accelerate, launch, --num_processes, "4"]` for multi-GPU. It runs the DiT in its own
+environment as a subprocess; set `dit.runtime.python`
 to that interpreter. Use `--stage train|sample` to run one half, or `--dry-run` to inspect the
 generated LightningDiT config without launching anything.
 

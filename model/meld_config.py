@@ -210,7 +210,7 @@ class MeldConfig:
         return os.path.join(self.dit_exp_dir(), "checkpoints")
 
     def dit_sample_dir(self):
-        """Reproduces the directory inference_single.py builds for its output."""
+        """Reproduces the directory inference.py builds for its output."""
         return os.path.join(
             self.dit_exp_dir(),
             f"samples-{self.dit.sample.total}-cfg{self.dit.sample.cfg_scale}",

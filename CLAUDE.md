@@ -93,7 +93,17 @@ the same `cfg.latent_path()`, so pinning `vae.encode.checkpoint` can no longer p
 the decoder cannot find.
 
 **3. Train/sample DiT** — `model/dit_adapter.py` emits a vendored-schema YAML into the experiment
-directory and runs `train_single.py` / `inference_single.py`. Conditioning is text-based CFG:
+directory and runs `train.py` / `inference.py`. Those are the only trainer and sampler: each always
+constructs an `Accelerator()`, so it runs one process under plain `python` and multi-GPU when
+`dit.runtime.launcher` is `[accelerate, launch, ...]`. **Loaders are per process**: the configured
+global batch (`dit.train.global_batch_size`, `dit.sample.batch_size`, `vae.loader.batch_size`) is
+divided by the process count (and by `grad_accum_steps` for training) before the `DataLoader` is
+built, and `split_batches` is set off explicitly and asserted (newer Accelerate silently ignores
+`Accelerator(split_batches=True)`, so never rely on it). `dit.train.mixed_precision` defaults to
+`fp16`, which is meant for GPUs (use `no` on CPU). The sampler shards sample "slots" through a
+per-process loader and gathers them back in slot order, so `conditions.csv.gz` row `j` describes
+`samples.pt` row `j` (step 4 numbers patients by sample position); it checks that order before
+saving. Conditioning is text-based CFG:
 condition rows are rendered to prompts by `datasets/condition2text.py` and embedded by a frozen
 `CLIPTextEmbedder`, which is built **unconditionally** — so a CLIP checkpoint is required even at
 `cfg_scale: 0`. Set `dit.runtime.clip_model_path` or `$MELD_CLIP_PATH`.
