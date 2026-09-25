@@ -30,19 +30,20 @@ class HDF5Dataset(torch.utils.data.Dataset):
         if self.file is None:
             self.file = h5py.File(self.h5_path, 'r', swmr=True)
         
-        # HDF5 bulk reading is orders of magnitude faster if indices are sorted
-        sorted_indices = sorted(indices)
-        
+        # HDF5 bulk reading is orders of magnitude faster if indices are sorted, and h5py
+        # requires them strictly increasing. Accelerate pads a short final batch by
+        # wrapping around, which can repeat an index, so de-duplicate as well as sort.
+        sorted_indices, unsort_indices = np.unique(np.asarray(indices), return_inverse=True)
+        sorted_indices = sorted_indices.tolist()
+
         # Do ONE disk read per tensor instead of 128
         p_data = self.file['processed_data'][sorted_indices]
         t_info = self.file['time_info'][sorted_indices]
         missing_data = self.file['missing'][sorted_indices]
         masking_data = self.file['masking'][sorted_indices]
-        
-        # Because we sorted the indices to please HDF5, we ruined the DataLoader's random shuffle.
-        # We need to unsort them to match the original random `indices` list.
-        unsort_map = {val: i for i, val in enumerate(sorted_indices)}
-        unsort_indices = [unsort_map[val] for val in indices]
+
+        # Sorting ruined the DataLoader's random shuffle; `unsort_indices` maps every
+        # requested index back to its row, restoring the original order.
         
         # Re-apply the random order and convert to tensors
         return [

@@ -13,6 +13,7 @@ import os
 
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
@@ -29,8 +30,11 @@ def main():
 
     # cfg.vae.runtime.device == "cpu" forces CPU even under a plain `python` launch;
     # "auto"/"cuda" defer to Accelerate/the launcher (e.g. `accelerate launch --cpu`).
-    accelerator = Accelerator(split_batches=True,
+    # Loaders are per process (see `per_proc` below), so never split a batch again.
+    accelerator = Accelerator(dataloader_config=DataLoaderConfiguration(split_batches=False),
                               cpu=(str(cfg.vae.runtime.device) == "cpu"))
+    if accelerator.split_batches:   # would divide the per-process batch a second time
+        raise RuntimeError("split_batches must be off: the loaders are already per process")
     is_main = accelerator.is_main_process
     device = accelerator.device
 
@@ -62,14 +66,23 @@ def main():
     stages = set(cfg.vae.stages)
     t = cfg.vae.train
 
+    # `vae.loader.batch_size` is the global batch. Every process loads batch / world rows
+    # itself, and Accelerate deals those whole batches to the ranks round-robin.
+    batch = int(cfg.vae.loader.batch_size)
+    if batch % accelerator.num_processes:
+        raise ValueError(f"vae.loader.batch_size ({batch}) must be divisible by the "
+                         f"number of processes ({accelerator.num_processes})")
+    per_proc = batch // accelerator.num_processes
+
     if "train" in stages:
         log("Training VAE...")
         train_ds, val_ds = vc.split_dataset(cfg, dataset)
         log(f"Train/val split: {len(train_ds)}/{len(val_ds)} "
             f"(seed {cfg.vae.data.split_seed})")
 
-        # split_batches=True means the configured batch size is the global one.
-        per_proc = max(1, int(cfg.vae.loader.batch_size) // accelerator.num_processes)
+        if len(train_ds) < batch:
+            raise ValueError(f"the training split has {len(train_ds)} rows, fewer than "
+                             f"vae.loader.batch_size ({batch}); lower the batch size")
         opts = vc.loader_kwargs(cfg, per_proc)
         train_loader = DataLoader(train_ds, shuffle=True, drop_last=True, **opts)
         val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **opts)
@@ -111,7 +124,7 @@ def main():
 
         latents = vc.encode_latents(
             model, dataset, cfg, device,
-            batch_size=cfg.vae.loader.batch_size,
+            batch_size=per_proc, prepare_fn=accelerator.prepare,
             gather_fn=accelerator.gather_for_metrics, is_main_process=is_main)
 
         if is_main:

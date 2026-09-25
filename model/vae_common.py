@@ -235,8 +235,14 @@ def process_epoch(epoch, data_loader, model, optimizer, device, min_kl, beta,
 
 
 def encode_latents(model, dataset, cfg, device, batch_size=None, sample_size=None,
-                   gather_fn=None, is_main_process=True):
-    """Encode every sequence, restoring the dataset's original row order."""
+                   gather_fn=None, is_main_process=True, prepare_fn=None):
+    """Encode every sequence, restoring the dataset's original row order.
+
+    Under Accelerate pass both hooks: `prepare_fn=accelerator.prepare` shards the loader
+    across processes (otherwise every rank encodes the whole dataset and the gathered
+    result holds each row once per process), and `gather_fn=accelerator.gather_for_metrics`
+    collects the shards and drops the rows Accelerate pads onto a short final batch.
+    """
     from tqdm import tqdm
 
     target = model.module if hasattr(model, "module") else model
@@ -244,6 +250,8 @@ def encode_latents(model, dataset, cfg, device, batch_size=None, sample_size=Non
 
     kwargs = loader_kwargs(cfg, batch_size or cfg.vae.encode.batch_size)
     loader = DataLoader(IndexedDataset(dataset), shuffle=False, drop_last=False, **kwargs)
+    if prepare_fn is not None:
+        loader = prepare_fn(loader)
 
     emb_list, idxs_list, seen = [], [], 0
     with torch.no_grad():
@@ -256,7 +264,7 @@ def encode_latents(model, dataset, cfg, device, batch_size=None, sample_size=Non
             if is_main_process:
                 emb_list.append(emb_batch.cpu())
                 idxs_list.append(idxs.cpu())
-            seen += data.shape[0]
+            seen += emb_batch.shape[0]      # rows gathered from all processes
             # Stop once enough rows are collected; the old code compared batch counts
             # after appending, so it always ran one batch past the limit and then
             # never trimmed the result.
